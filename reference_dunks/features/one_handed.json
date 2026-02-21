@@ -1,0 +1,9 @@
+{
+  "rotation_degrees": 5,
+  "max_vertical_inches": 24,
+  "hang_time_s": 0.4,
+  "left_wrist_sweep_deg": 0,
+  "right_wrist_sweep_deg": 0,
+  "wrist_below_hip": 0,
+  "description": "Standard dunk — just goes in."
+}

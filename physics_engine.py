@@ -201,9 +201,8 @@ class PhysicsEngine:
                         best_start, best_end = core_start, core_end
                         max_airborne_duration = core_dur
 
-        # Guard against tracking glitches/slow-motion artifacts producing impossible airtime.
-        # Typical dunk hang times are usually below ~1.0s; keep physics output in a plausible band.
-        hang_time_s = min(max_airborne_duration, 1.3)
+        # Average dunk hang ~0.53s; most in-game 0.35–0.55s. Cap raw to avoid overestimation.
+        hang_time_s = min(max_airborne_duration, 0.60)
         airborne_frames_for_arms = valid[best_start : best_end + 1] if max_airborne_duration > 0 else []
         airborne_start_frame_idx = (
             airborne_frames_for_arms[0].frame_idx if airborne_frames_for_arms else -1
@@ -230,23 +229,22 @@ class PhysicsEngine:
                         break
         rotation_frames = airborne_frames_for_arms[: rim_touch_end_idx + 1]
 
-        # Max vertical: hip height delta (MediaPipe y is normalized 0-1)
-        # Use first 20% as "ground" baseline (standing/crouch before jump)
+        # Max vertical: physics formula h = g*t^2/8 (flight time to jump height). Prefer underball.
+        # Hang time (s) -> vertical (m): h_m = g * t^2 / 8. Then inches = h_m / 0.0254.
+        flight_vertical_inches = (9.81 * (hang_time_s ** 2) / 8.0) / 0.0254 if hang_time_s > 0 else 0.0
         ground_frames = valid[: max(1, len(valid) // 5)]
         start_hip_y = max(p.mid_hip_y for p in ground_frames if p.mid_hip_y is not None)
         hip_ys = [p.mid_hip_y for p in valid if p.mid_hip_y is not None]
         min_hip_y = min(hip_ys)
-        delta_normalized = start_hip_y - min_hip_y  # lower y = higher in frame
+        delta_normalized = start_hip_y - min_hip_y
         delta_pixels = delta_normalized * self.frame_height
         pixel_vertical_inches = max(0.0, self._pixel_delta_to_inches(delta_pixels))
-        # Physics-based vertical from flight time: h = g * t^2 / 8
-        # (t is total flight time from takeoff to landing).
-        flight_vertical_inches = (9.81 * (hang_time_s ** 2) / 8.0) / 0.0254 if hang_time_s > 0 else 0.0
-        # Keep pixel estimate grounded in flight-time physics (allows some pose noise margin).
+        # Use lower of pixel estimate or physics-based; apply 0.92 factor to underball (user preference).
         if flight_vertical_inches > 0.0:
-            max_plausible_from_flight = (flight_vertical_inches * 1.35) + 2.0
-            pixel_vertical_inches = min(pixel_vertical_inches, max_plausible_from_flight)
-        max_vertical_inches = max(0.0, min(48.0, pixel_vertical_inches))
+            conservative_flight = flight_vertical_inches * 0.92
+            pixel_vertical_inches = min(pixel_vertical_inches, conservative_flight)
+        # Conservative cap 36" to avoid overestimation (elite ~40" but we underball).
+        max_vertical_inches = max(0.0, min(36.0, pixel_vertical_inches))
         apex_height_ft = (72.0 + max_vertical_inches) / 12.0
         estimated_vertical_leap_inches = max_vertical_inches
 

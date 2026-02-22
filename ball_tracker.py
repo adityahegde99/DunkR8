@@ -192,6 +192,37 @@ def analyze_ball_trajectory(
         rebound_angle_deg = _angle_between_vectors(inc, out)
         backboard_rebound_detected = abs(inc[0]) > 2.0 and abs(out[0]) > 2.0 and (inc[0] * out[0] < 0)
 
+    # Off-glass lob: ball goes up (y decreases) to a peak near top of path, then comes down (y increases).
+    if not backboard_rebound_detected and y_range > 8.0:
+        vertical_peak_idx = -1
+        vertical_peak_score = 0.0
+        min_vertical_prom = max(4.0, 0.06 * y_range)
+        for i in range(2, n - 2):
+            if not (ys_s[i] <= ys_s[i - 1] and ys_s[i] <= ys_s[i + 1]):
+                continue
+            near_top = ys_s[i] <= (y_min + 0.50 * y_range)
+            if not near_top:
+                continue
+            prev_i = max(0, i - 2)
+            next_i = min(n - 1, i + 2)
+            inc_y = ys_s[i] - ys_s[prev_i]
+            out_y = ys_s[next_i] - ys_s[i]
+            # Incoming upward (negative in image y), outgoing downward (positive).
+            if inc_y <= -min_vertical_prom and out_y >= min_vertical_prom:
+                score = abs(inc_y) + abs(out_y)
+                if score > vertical_peak_score:
+                    vertical_peak_score = score
+                    vertical_peak_idx = i
+        if vertical_peak_idx >= 0:
+            backboard_rebound_detected = True
+            prev_i = max(0, vertical_peak_idx - 2)
+            next_i = min(n - 1, vertical_peak_idx + 2)
+            inc = (xs_s[vertical_peak_idx] - xs_s[prev_i], ys_s[vertical_peak_idx] - ys_s[prev_i])
+            out = (xs_s[next_i] - xs_s[vertical_peak_idx], ys_s[next_i] - ys_s[vertical_peak_idx])
+            rebound_angle_deg = _angle_between_vectors(inc, out)
+            if rebound_idx < 0:
+                rebound_idx = vertical_peak_idx
+
     # Final lob type decision from trajectory cues.
     lob_type = "unknown"
     if bounce_detected and not backboard_rebound_detected:

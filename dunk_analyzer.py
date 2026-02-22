@@ -650,8 +650,8 @@ def _classify_dunk_type(
 ) -> str:
     rotation = result.rotation_degrees
     dominant_sweep = max(result.left_wrist_angle_sweep_deg, result.right_wrist_angle_sweep_deg)
-    # MediaPipe yaw can be noisy; widen reverse band to avoid mislabeling true reverses.
-    reverse = 120 <= rotation <= 260
+    # MediaPipe yaw can be noisy; use a wide reverse band so true reverse dunks are not labeled windmill.
+    reverse = 95 <= rotation <= 275
     spin360 = 300 <= rotation <= 420
     # Reserve 540 for clearly elite airtime/height so noisy heading drift does not dominate.
     spin540 = (
@@ -659,10 +659,30 @@ def _classify_dunk_type(
         and result.hang_time_s >= 0.5
         and result.max_vertical_inches >= 16.0
     )
-    between_legs = bool(result.wrist_below_hip_near_midline and leg_tuck_angle_deg > 0 and leg_tuck_angle_deg <= 120)
+    thread_count = _thread_events(airborne_frames)
+    # Eastbay: midline wrist when below hip, or clear thread event with wrist below hip and limited sweep.
+    between_legs = bool(
+        result.wrist_below_hip_near_midline
+        and 0 < leg_tuck_angle_deg <= 120
+        and (thread_count >= 1 or leg_tuck_angle_deg <= 95)
+        and dominant_sweep <= 255
+    ) or bool(
+        result.wrist_went_below_hip
+        and thread_count >= 1
+        and 0 < leg_tuck_angle_deg <= 105
+        and dominant_sweep <= 260
+    )
+    # Windmills in game footage often under-estimate sweep; accept medium sweep with below-hip arm path.
     windmill = bool(
-        dominant_sweep >= 220
-        and (result.wrist_went_below_hip or shoulder_flexion_angle_deg >= 95)
+        (
+            dominant_sweep >= 200
+            and (result.wrist_went_below_hip or shoulder_flexion_angle_deg >= 95)
+        )
+        or (
+            dominant_sweep >= 165
+            and result.wrist_went_below_hip
+            and not between_legs
+        )
     )
     behind_back = bool(result.wrist_went_below_hip and not result.wrist_below_hip_near_midline and 130 <= dominant_sweep <= 320)
     double_pump_raw = _detect_double_pump(airborne_frames)
@@ -677,7 +697,6 @@ def _classify_dunk_type(
     statue = _detect_statue_of_liberty(airborne_frames, dominant_sweep)
     tomahawk = _detect_tomahawk(airborne_frames, dominant_sweep)
     double_tomahawk = bool(result.two_hands_cue and dominant_sweep >= 170 and rotation < 120)
-    thread_count = _thread_events(airborne_frames)
     double_eastbay = between_legs and thread_count >= 2
 
     if takeoff_distance_ft >= 15.0 and result.hang_time_s >= 0.45:
@@ -752,18 +771,15 @@ def _classify_dunk_type(
 
 def _normalize_hang_time_s(raw_hang_s: float, max_vertical_inches: float) -> float:
     """
-    Normalize hang time against physics so slow-motion clips don't inflate airtime.
-    Typical dunk hang times are generally below ~1 second.
+    Average dunk hang ~0.53s; target display 0.35–0.55s. Underball: tight cap and physics bound.
     """
     raw = max(0.0, float(raw_hang_s))
     h_m = max(0.0, min(float(max_vertical_inches), 72.0)) * 0.0254
     if h_m <= 0:
-        return min(raw, 1.15)
-    expected = math.sqrt((8.0 * h_m) / 9.81)
-    expected = _clamp(expected, 0.28, 1.12)
-    if raw > (expected * 1.35):
-        return expected
-    return min(raw, 1.15)
+        return min(raw, 0.55)
+    expected_from_vertical = math.sqrt((8.0 * h_m) / 9.81)
+    expected_from_vertical = _clamp(expected_from_vertical, 0.20, 0.55)
+    return min(raw, expected_from_vertical * 0.95, 0.55)
 
 
 def _normalize_ball_air_time_s(
@@ -772,16 +788,14 @@ def _normalize_ball_air_time_s(
     lob_hint: bool,
 ) -> float:
     """
-    Normalize ball-air timing against jump timing to avoid long tracking-noise tails.
+    Ball air tracks hang; target display below 0.55s for non-lob, 0.62 for lob. Underball.
     """
     raw = max(0.0, float(raw_ball_air_s))
     if raw <= 0.0:
         return 0.0
-    expected_max = normalized_hang_time_s + (0.55 if lob_hint else 0.35)
-    expected_max = _clamp(expected_max, 0.28, 1.8 if lob_hint else 1.35)
-    if raw > (expected_max * 1.3):
-        return expected_max
-    return min(raw, 2.0 if lob_hint else 1.5)
+    expected_max = normalized_hang_time_s + (0.08 if lob_hint else 0.05)
+    expected_max = _clamp(expected_max, 0.15, 0.62 if lob_hint else 0.55)
+    return min(raw, expected_max * 0.95, 0.62 if lob_hint else 0.55)
 
 
 def _compute_output_confidences(
@@ -1016,17 +1030,19 @@ class DunkAnalyzer:
         trajectory = analyze_ball_trajectory(ball_detections)
         trajectory_bounce = bool(trajectory.get("bounce_detected", False))
         trajectory_backboard = bool(trajectory.get("backboard_rebound_detected", False))
-        trajectory_strong_lob = trajectory_bounce or trajectory_backboard
-        # Use only strong trajectory cues for lob subtype to avoid false lob assignments.
+        traj_lob_type = (trajectory.get("lob_type") or "").strip().lower()
+        trajectory_strong_lob = trajectory_bounce or trajectory_backboard or (traj_lob_type in ("backboard", "bounce"))
+        # Use strong cues first; then trajectory's lob_type from heuristics (e.g. flat arc => backboard).
         if trajectory_bounce and not trajectory_backboard:
             effective_lob_type = "bounce"
         elif trajectory_backboard and not trajectory_bounce:
             effective_lob_type = "backboard"
         elif trajectory_backboard and trajectory_bounce:
-            # Prefer whichever cue is stronger by angle consistency.
             bounce_ang = float(trajectory.get("bounce_angle_deg", 0.0) or 0.0)
             rebound_ang = float(trajectory.get("rebound_angle_deg", 0.0) or 0.0)
             effective_lob_type = "bounce" if bounce_ang >= rebound_ang else "backboard"
+        elif traj_lob_type in ("backboard", "bounce"):
+            effective_lob_type = traj_lob_type
         else:
             effective_lob_type = "unknown"
         normalized_hang_time_s = _normalize_hang_time_s(physics.hang_time_s, physics.max_vertical_inches)
@@ -1293,6 +1309,20 @@ class DunkAnalyzer:
         else:
             lob_mode = "none"
 
+        # Fallback: use RAW times (caps make normalized comparison useless). Ball in air longer than jumper => self-lob (e.g. off-glass).
+        raw_ball_longer_than_jumper = ball_air_time_s >= (physics.hang_time_s + 0.06)
+        if (
+            lob_mode == "none"
+            and raw_ball_longer_than_jumper
+            and ball_air_time_s >= 0.22
+            and ball_features.crossed_upward_first
+            and has_ball_track
+            and (ball_controlled or downward_through_rim or ball_finish_inside)
+            and can_infer_lob_from_timing
+        ):
+            lob_mode = "self-lob"
+            effective_lob_type = "backboard"
+
         validation_checks["pre_takeoff_control"] = pre_takeoff_control
         validation_checks["received_in_air"] = received_in_air
         validation_checks["can_infer_lob_from_timing"] = can_infer_lob_from_timing
@@ -1410,11 +1440,31 @@ class DunkAnalyzer:
             )
             eastbay_model_label = ("eastbay" in model_label) or ("between-the-legs" in model_label)
             reverse_model_label = ("180" in model_label) or ("reverse" in model_label)
+            eastbay_cue_strong = bool(
+                physics.wrist_below_hip_near_midline
+                and leg_tuck_angle_deg <= 110
+                and dominant_sweep <= 245
+            )
+            # Softer Eastbay cue: wrist went below hip with moderate tuck/sweep (between-legs possible even if midline missed).
+            eastbay_cue_soft = bool(
+                physics.wrist_went_below_hip
+                and leg_tuck_angle_deg <= 125
+                and dominant_sweep <= 265
+            )
+            windmill_cue_strong = bool(
+                physics.wrist_went_below_hip
+                and not physics.wrist_below_hip_near_midline
+                and dominant_sweep >= 160
+            )
             if (not lob_lock) or model_is_lob_family:
-                if eastbay_model_label and model_confidence >= 0.60:
+                if eastbay_model_label and model_confidence >= 0.60 and eastbay_cue_strong and not windmill_cue_strong:
                     dunk_type = model_prediction
+                elif eastbay_model_label and model_confidence >= 0.55 and (eastbay_cue_strong or eastbay_cue_soft) and not windmill_cue_strong and dunk_type == "One-Hand Power Dunk":
+                    dunk_type = normalize_dunk_label(model_prediction) or model_prediction
                 elif reverse_model_label and model_confidence >= 0.60:
                     dunk_type = model_prediction
+                elif reverse_model_label and model_confidence >= 0.55 and dunk_type == "Standard Windmill":
+                    dunk_type = normalize_dunk_label(model_prediction) or model_prediction
                 elif ("windmill" in model_label and model_confidence >= 0.60) or model_confidence >= 0.66:
                     dunk_type = model_prediction
         if clip_hint_label:
@@ -1469,6 +1519,20 @@ class DunkAnalyzer:
                 dunk_type = "Off-Glass Lob"
         elif lob_mode == "alley-oop" and dunk_type not in {"Alley-Oop 360", "Alley-Oop Reverse", "Lob Eastbay", "Lob Windmill"}:
             dunk_type = "Alley-Oop Power"
+        # Safety override: prevent obvious windmill motion from being mislabeled as Eastbay/Power variants.
+        windmill_motion_strong = bool(
+            physics.wrist_went_below_hip
+            and not physics.wrist_below_hip_near_midline
+            and dominant_sweep >= 165
+        )
+        if windmill_motion_strong and dunk_type in {
+            "Eastbay (Between-the-Legs)",
+            "Reverse Eastbay",
+            "Lob Eastbay",
+            "One-Hand Power Dunk",
+            "Two-Hand Power Dunk",
+        }:
+            dunk_type = "Standard Windmill"
         entry = DUNK_ONTOLOGY.get(dunk_type)
         primary_category = entry.primary_category if entry else "CATEGORY A — Power Finishes"
         score_components = _compute_score(

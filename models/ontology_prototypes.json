@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "trained_at": "2026-02-22T09:43:38.109298+00:00",
+  "trained_at": "2026-02-22T15:15:14.412318+00:00",
   "feature_keys": [
     "rotation_degrees",
     "hang_time_s",
@@ -59,7 +59,7 @@
     "180 Dunk": 2,
     "Tomahawk (Single Arm)": 1,
     "Two-Hand Power Dunk": 1,
-    "Standard Windmill": 3
+    "Standard Windmill": 5
   },
   "class_radii": {
     "360 Dunk": 0.18,
@@ -74,7 +74,7 @@
     "180 Dunk": 1.2169020218835345,
     "Tomahawk (Single Arm)": 0.18,
     "Two-Hand Power Dunk": 0.18,
-    "Standard Windmill": 1.49043922270276
+    "Standard Windmill": 1.4793638625822956
   },
   "prototypes": {
     "360 Dunk": {
@@ -258,19 +258,19 @@
       "lob_rebound_angle_deg": 116.1552621375702
     },
     "Standard Windmill": {
-      "rotation_degrees": 15.964081265316247,
-      "hang_time_s": 0.7842219394962476,
-      "max_vertical_inches": 37.22885975466219,
-      "left_wrist_sweep_deg": 332.0026238024957,
-      "right_wrist_sweep_deg": 148.29199666084884,
-      "wrist_below_hip": 0.3333333333333333,
-      "wrist_below_hip_midline": 0.3333333333333333,
-      "two_hands_cue": 0.6666666666666666,
-      "ball_air_time_s": 1.5999999999999999,
-      "lob_bounce": 0.6666666666666666,
-      "lob_backboard": 0.3333333333333333,
-      "lob_bounce_angle_deg": 99.71445495862861,
-      "lob_rebound_angle_deg": 111.30893766918227
+      "rotation_degrees": 35.654614302410494,
+      "hang_time_s": 0.9305331636977485,
+      "max_vertical_inches": 41.53731585279731,
+      "left_wrist_sweep_deg": 199.20157428149741,
+      "right_wrist_sweep_deg": 102.02481502597387,
+      "wrist_below_hip": 0.4,
+      "wrist_below_hip_midline": 0.2,
+      "two_hands_cue": 0.6,
+      "ball_air_time_s": 1.2133333333333334,
+      "lob_bounce": 0.6,
+      "lob_backboard": 0.4,
+      "lob_bounce_angle_deg": 94.02184976141677,
+      "lob_rebound_angle_deg": 131.4356122891025
     }
   }
 }

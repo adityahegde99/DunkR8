@@ -62,12 +62,11 @@ def _sanitize_commentary(text: str) -> str:
 
 
 def _cap_display_metrics(analysis) -> dict:
-    """Cap displayed metrics to plausible ranges to avoid overestimates."""
-    vertical = min(float(analysis.max_vertical_inches or 0), 48.0)
-    hang = min(float(analysis.hang_time_s or 0), 1.2)
+    """Conservative ranges: hang/ball air 0.35–0.55s; vertical max 36". Prefer underball."""
+    vertical = min(float(analysis.max_vertical_inches or 0), 36.0)
+    hang = min(float(analysis.hang_time_s or 0), 0.55)
     ball_air = getattr(analysis, "ball_air_time_s", None) or 0.0
-    if ball_air > 2.0:
-        ball_air = 2.0
+    ball_air = min(ball_air, 0.55)
     return {"vertical": vertical, "hang_time_s": hang, "ball_air_time_s": ball_air}
 
 
@@ -168,9 +167,18 @@ def main():
     /* Import Google Fonts for thick, modern typography */
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
     
+    /* Aggressive top gap removal - target all potential sources */
+    html, body { margin: 0 !important; padding: 0 !important; }
+    #root { margin: 0 !important; padding: 0 !important; }
+    .stApp { margin: 0 !important; padding: 0 !important; }
+    .main { margin-top: 0 !important; padding-top: 0 !important; }
+    section.main { margin-top: 0 !important; padding-top: 0 !important; }
+    [data-testid="block-container"] { margin-top: 0 !important; padding-top: 0 !important; }
+    .element-container:first-child { margin-top: 0 !important; padding-top: 0 !important; }
+    
     /* Hide sidebar completely */
     section[data-testid="stSidebar"] { display: none !important; }
-    .main .block-container { padding-left: 2rem !important; max-width: 100% !important; }
+    .main .block-container { padding: 4rem 2rem 1rem 2rem !important; max-width: 100% !important; margin-top: 0 !important; }
     
     /* Base styling - dark/black theme */
     .stApp { 
@@ -178,22 +186,28 @@ def main():
         min-height: 100vh;
         font-family: 'Inter', sans-serif !important;
         overflow-x: visible !important;
+        padding-top: 0 !important;
+        margin-top: 0 !important;
+        position: relative;
+        top: 0;
     }
+    .main .block-container > *:first-child { margin-top: 0 !important; padding-top: 0 !important; }
     .main .block-container { overflow: visible !important; }
     
     /* Hide default header */
     [data-testid="stHeader"] { display: none !important; }
     
-    /* Navbar: full width, narrow height, stuck to top */
+    /* Navbar: full width, narrow height, absolutely flush to top */
     .app-header {
-        position: sticky;
-        top: 0;
+        position: fixed;
+        top: 0 !important;
         left: 0;
         right: 0;
         width: 100vw;
+        margin-top: 0 !important;
+        margin-bottom: 1.5rem;
         margin-left: calc(-50vw + 50%);
         margin-right: calc(-50vw + 50%);
-        margin-bottom: 1.5rem;
         background: linear-gradient(90deg, rgba(10,10,10,0.98), rgba(18,18,18,0.96));
         backdrop-filter: blur(12px);
         border-bottom: 1px solid rgba(0,255,255,0.2);
@@ -203,6 +217,7 @@ def main():
         justify-content: space-between;
         z-index: 999;
         animation: slideInDown 0.5s ease-out;
+        box-sizing: border-box;
     }
     
     .logo-section {
@@ -774,7 +789,8 @@ def main():
             lob_type=lob_type,
             frame_width=frame_width,
             frame_height=frame_height,
-            clip_name=Path(uploaded_file.name).stem,
+            # Do not bias live inference by filename words.
+            clip_name="",
             ai_api_key=deepseek_api_key,
         )
 
@@ -984,6 +1000,9 @@ def main():
                     </div>
                 </div>
                 
+                <div style="text-align:center; color:#94a3b8; font-size:0.92rem; font-weight:500; margin-bottom:0.8rem;">
+                    Technical metrics are estimates; actual values may vary by camera angle, frame rate, and tracking quality.
+                </div>
                 <!-- Technical Metrics Grid -->
                 <div style="
                     display: grid; 
@@ -1019,6 +1038,9 @@ def main():
                         <div style="font-size: 0.9rem; color: #64748b; margin-bottom: 0.5rem; font-weight: 600;">LOB TYPE</div>
                         <div style="font-size: 1.8rem; font-weight: 800; color: #ffffff;">{analysis.lob_type or "Standard"}</div>
                     </div>
+                </div>
+                <div style="text-align:center; color:#64748b; font-size:0.85rem; font-weight:500; margin-top:-1.2rem; margin-bottom:1.4rem;">
+                    Estimates only - actual measurements may vary.
                 </div>
                 
                 <!-- Confidence Metrics -->

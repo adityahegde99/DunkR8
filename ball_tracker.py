@@ -246,28 +246,39 @@ def compute_ball_air_time(
     """
     if not detections or fps <= 0:
         return 0.0
-    in_air_segments: List[Tuple[float, float]] = []
-    segment_start: Optional[float] = None
-    for _idx, ball, ts in detections:
-        if ball is not None:
-            if segment_start is None:
-                segment_start = ts
-        else:
-            if segment_start is not None:
-                in_air_segments.append((segment_start, ts))
-                segment_start = None
-    if segment_start is not None:
-        in_air_segments.append((segment_start, detections[-1][2]))
-    if not in_air_segments:
+
+    # Start from the most coherent tracked segment so crowd false-positives don't dominate.
+    segment = _get_longest_air_segment(detections, gap_seconds=gap_seconds)
+    if len(segment) < 4:
         return 0.0
-    # Merge segments that are close (same "lob")
-    merged: List[Tuple[float, float]] = []
-    for s, e in sorted(in_air_segments):
-        if merged and s - merged[-1][1] <= gap_seconds:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-        else:
-            merged.append((s, e))
-    return max(e - s for s, e in merged) if merged else 0.0
+
+    times = [ts for (_idx, _ball, ts) in segment]
+    ys = [float(ball[1]) for (_idx, ball, _ts) in segment]
+    raw_duration = max(0.0, times[-1] - times[0])
+
+    # If raw track is already plausible, use it.
+    if raw_duration <= 2.0:
+        return raw_duration
+
+    # Long segments are usually tracking noise. Extract the core arc around apex.
+    apex_idx = min(range(len(ys)), key=lambda i: ys[i])  # lowest y in image => highest ball point
+    y_min, y_max = min(ys), max(ys)
+    y_range = max(1.0, y_max - y_min)
+    # Core arc band near apex (keeps only the "true lob" part).
+    core_band = y_min + (0.38 * y_range)
+
+    start_idx = apex_idx
+    while start_idx > 0 and ys[start_idx] <= core_band:
+        start_idx -= 1
+    end_idx = apex_idx
+    while end_idx < (len(ys) - 1) and ys[end_idx] <= core_band:
+        end_idx += 1
+
+    # Expand slightly for realism but keep physically plausible limits.
+    start_idx = max(0, start_idx - 1)
+    end_idx = min(len(times) - 1, end_idx + 1)
+    core_duration = max(0.0, times[end_idx] - times[start_idx])
+    return min(core_duration, 2.0)
 
 
 def draw_ball(frame: np.ndarray, center_radius: Optional[Tuple[int, int, float]], color=(255, 165, 0)) -> np.ndarray:

@@ -63,6 +63,18 @@ FEATURE_WEIGHTS = {
 }
 
 
+def _normalize_hang_time_feature(raw_hang_s: float, max_vertical_inches: float) -> float:
+    raw = max(0.0, float(raw_hang_s))
+    h_m = max(0.0, min(float(max_vertical_inches), 72.0)) * 0.0254
+    if h_m <= 0:
+        return min(raw, 1.15)
+    expected = math.sqrt((8.0 * h_m) / 9.81)
+    expected = max(0.28, min(1.12, expected))
+    if raw > (expected * 1.35):
+        return expected
+    return min(raw, 1.15)
+
+
 def build_feature_dict(
     result: PhysicsResult,
     ball_air_time_s: float,
@@ -76,9 +88,13 @@ def build_feature_dict(
         bounce_angle = 0.0
     if not math.isfinite(rebound_angle):
         rebound_angle = 0.0
+    norm_hang = _normalize_hang_time_feature(
+        float(result.hang_time_s),
+        float(getattr(result, "max_vertical_inches", 0.0)),
+    )
     return {
         "rotation_degrees": float(result.rotation_degrees),
-        "hang_time_s": float(result.hang_time_s),
+        "hang_time_s": float(norm_hang),
         "max_vertical_inches": float(result.max_vertical_inches),
         "left_wrist_sweep_deg": float(getattr(result, "left_wrist_angle_sweep_deg", 0.0)),
         "right_wrist_sweep_deg": float(getattr(result, "right_wrist_angle_sweep_deg", 0.0)),

@@ -30,6 +30,8 @@ class Landmark:
     RIGHT_WRIST = 16
     LEFT_HIP = 23
     RIGHT_HIP = 24
+    LEFT_KNEE = 25
+    RIGHT_KNEE = 26
     LEFT_ANKLE = 27
     RIGHT_ANKLE = 28
     LEFT_HEEL = 29
@@ -180,12 +182,16 @@ class PoseProcessor:
         right_heel = _get_landmark(lm, Landmark.RIGHT_HEEL) if len(lm) > Landmark.RIGHT_HEEL else None
         left_hip = _get_landmark(lm, Landmark.LEFT_HIP)
         right_hip = _get_landmark(lm, Landmark.RIGHT_HIP)
+        left_knee = _get_landmark_xy(lm, Landmark.LEFT_KNEE) if len(lm) > Landmark.LEFT_KNEE else None
+        right_knee = _get_landmark_xy(lm, Landmark.RIGHT_KNEE) if len(lm) > Landmark.RIGHT_KNEE else None
         left_shoulder = _get_landmark_xy(lm, Landmark.LEFT_SHOULDER)
         right_shoulder = _get_landmark_xy(lm, Landmark.RIGHT_SHOULDER)
         left_elbow = _get_landmark_xy(lm, Landmark.LEFT_ELBOW) if len(lm) > Landmark.LEFT_ELBOW else None
         right_elbow = _get_landmark_xy(lm, Landmark.RIGHT_ELBOW) if len(lm) > Landmark.RIGHT_ELBOW else None
         left_wrist = _get_landmark_xy(lm, Landmark.LEFT_WRIST) if len(lm) > Landmark.LEFT_WRIST else None
         right_wrist = _get_landmark_xy(lm, Landmark.RIGHT_WRIST) if len(lm) > Landmark.RIGHT_WRIST else None
+        left_ankle_xy = _get_landmark_xy(lm, Landmark.LEFT_ANKLE) if len(lm) > Landmark.LEFT_ANKLE else None
+        right_ankle_xy = _get_landmark_xy(lm, Landmark.RIGHT_ANKLE) if len(lm) > Landmark.RIGHT_ANKLE else None
         nose = _get_landmark(lm, Landmark.NOSE)
 
         left_foot_y = None
@@ -200,8 +206,10 @@ class PoseProcessor:
             right_foot_y = (right_ankle or right_heel)[1]
 
         mid_hip_y = (left_hip[1] + right_hip[1]) / 2.0 if left_hip and right_hip else None
+        mid_hip_x = (left_hip[0] + right_hip[0]) / 2.0 if left_hip and right_hip else None
         left_hip_xy = (left_hip[0], left_hip[1]) if left_hip else None
         right_hip_xy = (right_hip[0], right_hip[1]) if right_hip else None
+        nose_xy = (nose[0], nose[1]) if nose else None
         body_height_norm = None
         if nose and mid_hip_y is not None and (left_foot_y or right_foot_y):
             foot_y = left_foot_y if left_foot_y is not None else right_foot_y
@@ -213,10 +221,16 @@ class PoseProcessor:
             right_heel_y=right_foot_y,
             mid_hip_y=mid_hip_y,
             body_height_norm=body_height_norm,
+            mid_hip_x=mid_hip_x,
+            nose=nose_xy,
             left_shoulder=left_shoulder,
             right_shoulder=right_shoulder,
             left_hip=left_hip_xy,
             right_hip=right_hip_xy,
+            left_knee=left_knee,
+            right_knee=right_knee,
+            left_ankle=left_ankle_xy,
+            right_ankle=right_ankle_xy,
             left_elbow=left_elbow,
             right_elbow=right_elbow,
             left_wrist=left_wrist,

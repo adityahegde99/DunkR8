@@ -2,7 +2,6 @@
 Slam Dunk Score Predictor
 Upload MP4 dunk video, view MediaPipe skeleton overlay, and get Judges' Scorecard.
 """
-import base64
 import tempfile
 from pathlib import Path
 
@@ -10,9 +9,8 @@ import streamlit as st
 import cv2
 
 from pose_processor import PoseProcessor, process_video
-from physics_engine import PhysicsEngine
-from dunk_classifier import DunkClassifier
-from scoring import ScoringAlgorithm, ScoreBreakdown
+from physics_engine import PhysicsEngine, PhysicsResult
+from dunk_analyzer import DunkAnalyzer
 
 
 def write_overlay_video_to_bytes(frames: list, fps: float) -> bytes:
@@ -50,7 +48,7 @@ def write_overlay_video_to_bytes(frames: list, fps: float) -> bytes:
 
 def main():
     st.set_page_config(
-        page_title="Slam Dunk Score Predictor",
+        page_title="DunkR8",
         page_icon="🏀",
         layout="wide",
         initial_sidebar_state="expanded",
@@ -64,7 +62,7 @@ def main():
     .stApp header { background: transparent !important; }
     [data-testid="stHeader"] { background: rgba(0,0,0,0.4) !important; backdrop-filter: blur(8px); }
     /* Main — smoother spacing */
-    .main .block-container { padding: 2.5rem 2.5rem 4rem; max-width: 1100px; }
+    .main .block-container { padding: 2.25rem 2.25rem 3.5rem; max-width: 1200px; }
     .main .block-container > div { margin-bottom: 1.25rem; }
     /* Sidebar */
     section[data-testid="stSidebar"] {
@@ -99,6 +97,13 @@ def main():
     [data-testid="stSlider"] div div { background: rgba(37,37,37,0.9) !important; border-radius: 6px; }
     /* Expander */
     .streamlit-expanderHeader { background: rgba(21,21,21,0.9) !important; color: #fff !important; border-radius: 10px; border: 1px solid rgba(255,255,255,0.06); }
+    /* Video */
+    [data-testid="stVideo"] {
+        border-radius: 14px;
+        overflow: hidden;
+        border: 1px solid rgba(255,255,255,0.08);
+        background: rgba(0,0,0,0.35);
+    }
     /* Extra metric cards at bottom */
     .extra-metric-card {
         background: rgba(18,18,18,0.9); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px;
@@ -109,36 +114,30 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
-    st.title("🏀 Slam Dunk Score Predictor")
-    st.caption("Computer vision analysis — NBA Slam Dunk Contest style")
+    st.title("🏀 DunkR8")
+    st.caption("Reliable dunk detection, taxonomy, and contest scoring")
 
     st.sidebar.header("Judges' Scorecard")
     st.sidebar.markdown("---")
-    with st.sidebar.expander("Train classifier from labeled clips"):
+    st.sidebar.caption(
+        "DunkR8 engine (pose + ball tracking)\n"
+        "with trainable dunk prototypes."
+    )
+    with st.sidebar.expander("Train model from reference clips"):
         st.caption(
-            "Put videos in **training_dunks/** by type, e.g. "
-            "`training_dunks/One-Handed/clip1.mp4`, `training_dunks/Windmill/w1.mp4`. "
-            "Then run training below (or in terminal: `python train_dunk_classifier.py`). "
-            "The app will use the trained model when present."
+            "Place clips in `reference_dunks/clips/` with dunk type names in filenames "
+            "(example: `windmill.mp4`, `360_dunk.mp4`, `reverse_eastbay.mp4`)."
         )
-        if st.button("Train classifier now"):
+        if st.button("Train DunkR8 model", use_container_width=True):
             try:
-                from train_dunk_classifier import main as train_main
-                with st.spinner("Processing clips and training…"):
-                    code = train_main()
-                if code == 0:
-                    st.success("Model saved. Refresh the page to use it.")
-                else:
-                    st.warning("No clips found or need more data. Add videos under training_dunks/<dunk_type>/.")
-            except Exception as e:
-                st.error(str(e))
-    with st.sidebar.expander("Reference dunks (closest match)"):
-        st.caption("Classification uses the closest reference. Add one clip per type to reference_dunks/clips/ (e.g. one_handed.mp4, windmill.mp4), then run below.")
-        if st.button("Build references from clips"):
-            try:
-                from dunk_reference import build_references_from_clips
-                refs = build_references_from_clips()
-                st.success(f"Built {len(refs)} reference(s). New uploads will match against these.")
+                from ontology_trainer import train_from_reference_clips
+                with st.spinner("Training model from reference clips..."):
+                    summary = train_from_reference_clips()
+                st.success(
+                    f"Trained {summary.classes_trained} class(es) from {summary.clips_used}/{summary.clips_found} clip(s)."
+                )
+                if summary.skipped:
+                    st.warning("Skipped clips:\n- " + "\n- ".join(summary.skipped[:6]))
             except Exception as e:
                 st.error(str(e))
     uploaded_file = st.sidebar.file_uploader(
@@ -150,7 +149,7 @@ def main():
     if uploaded_file is None:
         st.markdown(
             '<p style="color:#b0b0b0; font-size:1.1rem; margin-bottom:1.5rem;">'
-            'Upload a dunk clip to see pose + ball tracking and get a contest-style score (40–50).'
+            'Upload a dunk clip to run DunkR8 tracking and score it on a contest 40–50 scale.'
             '</p>',
             unsafe_allow_html=True,
         )
@@ -158,9 +157,9 @@ def main():
             st.markdown("""
             - **Player** — MediaPipe Pose tracks heels, hips, shoulders
             - **Ball** — Orange/red detection tracks the basketball (air time for lobs/alley-oops)
-            - **Physics** — Hang time, max vertical, rotation
-            - **Dunk type** — 360, Reverse/Windmill, Power, One-Hander, etc.
-            - **Score 40–50** — Contest scale; difficulty + hang time, rotation, height, lob/alley-oop
+            - **Physics** — Hang time, max vertical, rotation, arm path cues
+            - **Dunk ontology** — Canonical dunk taxonomy + strict rejection logic
+            - **Score 40–50** — Contest scale from difficulty, style, rotation, height, and lob context
             """)
         return
 
@@ -202,107 +201,148 @@ def main():
                 "Insufficient pose data for physics analysis. "
                 "Use a clip with the player fully visible (full body, good lighting)."
             )
-            result = type("Result", (), {
-                "hang_time_s": 0.0,
-                "max_vertical_inches": 0.0,
-                "rotation_degrees": 0.0,
-                "frames_airborne": 0,
-            })()
+            result = PhysicsResult(
+                hang_time_s=0.0,
+                max_vertical_inches=0.0,
+                rotation_degrees=0.0,
+                frames_airborne=0,
+                start_hip_y=0.0,
+                min_hip_y=0.0,
+            )
 
-        # Classify dunk type (difficulty; includes self-lob and over-object labels)
-        classifier = DunkClassifier()
-        classification = classifier.classify(result, pose_frames, ball_air_time_s=ball_air_time_s, lob_type=lob_type)
-        scorer = ScoringAlgorithm()
-        breakdown: ScoreBreakdown = scorer.compute(
-            dunk_base_score=classification.base_score,
-            dunk_type=classification.dunk_type or classification.label,
-            hang_time_s=result.hang_time_s,
-            max_vertical_inches=result.max_vertical_inches,
-            rotation_degrees=result.rotation_degrees,
+        analyzer = DunkAnalyzer()
+        frame_height, frame_width = skeleton_frames[0].shape[0], skeleton_frames[0].shape[1]
+        analysis = analyzer.analyze(
+            physics=result,
+            pose_frames=pose_frames,
+            ball_detections=ball_detections,
             ball_air_time_s=ball_air_time_s,
+            lob_type=lob_type,
+            frame_width=frame_width,
+            frame_height=frame_height,
+            clip_name=Path(uploaded_file.name).stem,
         )
 
-        # Sidebar: Judges' Scorecard
-        st.sidebar.subheader("Dunk classification")
-        st.sidebar.markdown(f"**{classification.label}**")
-        st.sidebar.caption(classification.description)
+        # Sidebar: judges scorecard + rejection model
+        if analysis.is_dunk:
+            st.sidebar.subheader("Dunk classification")
+            st.sidebar.markdown(f"**{analysis.dunk_type}**")
+            st.sidebar.caption(analysis.primary_category)
+        else:
+            st.sidebar.subheader("Rejection model")
+            st.sidebar.error(f"NOT A DUNK — {analysis.non_dunk_type}")
+            st.sidebar.caption(analysis.rejection_reason)
+
         st.sidebar.markdown("---")
-        st.sidebar.subheader("Metrics")
-        st.sidebar.metric("Hang Time", f"{result.hang_time_s:.2f}s")
-        st.sidebar.metric("Max Vertical", f"{result.max_vertical_inches:.1f} in")
-        st.sidebar.metric("Rotation", f"{result.rotation_degrees:.0f}°")
+        st.sidebar.subheader("Core metrics")
+        st.sidebar.metric("Hang Time", f"{analysis.hang_time_s:.2f}s")
+        st.sidebar.metric("Max Vertical", f"{analysis.max_vertical_inches:.1f} in")
+        st.sidebar.metric("Rotation", f"{analysis.rotation_degrees:.0f}°")
+        st.sidebar.metric("Ball Air Time", f"{analysis.ball_air_time_s:.2f}s" if analysis.ball_air_time_s > 0 else "—")
+        st.sidebar.metric("Model confidence", f"{analysis.model_confidence:.2f}" if analysis.model_confidence > 0 else "—")
+
+        comps = analysis.score_components
         st.sidebar.markdown("---")
         st.sidebar.subheader("Score Breakdown (40–50)")
-        st.sidebar.metric("Base (difficulty)", f"{breakdown.base_score:.1f}")
-        st.sidebar.metric("Hang Time Bonus", f"+{breakdown.hang_time_bonus:.1f}")
-        st.sidebar.metric("Rotation Bonus", f"+{breakdown.rotation_bonus:.1f}")
-        st.sidebar.metric("Height Bonus", f"+{breakdown.height_bonus:.1f}")
-        st.sidebar.metric("Lob / Alley-oop", f"+{breakdown.lob_bonus:.1f}" if breakdown.lob_bonus > 0 else "—")
-        st.sidebar.caption("Self-lob (backboard/bounce) or assist")
+        st.sidebar.metric("Base", f"{comps.base_score:.1f}")
+        st.sidebar.metric("Hang Bonus", f"+{comps.hang_time_bonus:.1f}")
+        st.sidebar.metric("Vertical Bonus", f"+{comps.vertical_bonus:.1f}")
+        st.sidebar.metric("Rotation Bonus", f"+{comps.rotation_bonus:.1f}")
+        st.sidebar.metric("Trick Bonus", f"+{comps.trick_bonus:.1f}")
+        st.sidebar.metric("Lob Bonus", f"+{comps.lob_bonus:.1f}" if comps.lob_bonus > 0 else "—")
+        st.sidebar.metric("Distance Bonus", f"+{comps.distance_bonus:.1f}" if comps.distance_bonus > 0 else "—")
+        st.sidebar.metric("Reliability Adj.", f"{comps.reliability_adjustment:+.1f}" if comps.reliability_adjustment else "—")
         st.sidebar.markdown("---")
-        st.sidebar.markdown(
-            f"### Predicted Score: **{breakdown.final_score:.1f}**"
-        )
-        st.sidebar.caption("NBA contest scale: 40–50 (50 = perfect)")
+        st.sidebar.markdown(f"### Predicted Score: **{analysis.final_contest_score:.1f}**")
+        st.sidebar.caption("NBA contest scale: 40–50")
 
-        st.success("Analysis complete. Review the tracking view and metrics below.")
+        if analysis.is_dunk:
+            st.success("Dunk detected. Review DunkR8 output below.")
+        else:
+            st.warning("Clip rejected as a dunk. Review the rejection reason and diagnostics below.")
 
-        # What the computer sees: scrubber always shows overlay; video when codec allows
-        st.subheader("What the computer sees")
-        st.caption("Green = player (pose). Orange = ball. Scrub to see any frame; all metrics come from this.")
-        n_frames = len(skeleton_frames) - 1 if skeleton_frames else 0
-        frame_idx = st.slider("Frame", 0, n_frames, 0, help="Scrub through the analyzed frames")
-        if skeleton_frames:
-            st.image(skeleton_frames[frame_idx], use_container_width=True)
+        # Single tracked video output (autoplay + controls)
+        st.subheader("DunkR8 Tracking View")
+        st.caption("Single playback output. Green = pose. Orange = ball.")
         overlay_bytes = write_overlay_video_to_bytes(skeleton_frames, fps)
         if overlay_bytes:
-            st.video(overlay_bytes, format="video/mp4", start_time=0)
-        # Four categories: Rotation, Dunk type, Alley-oop, Over object
-        rot_cat = getattr(classification, "rotation_category", "") or f"{result.rotation_degrees:.0f}°"
-        dunk_t = getattr(classification, "dunk_type", "") or classification.label
-        alley = getattr(classification, "is_alley_oop", breakdown.lob_bonus > 0)
-        over_obj = getattr(classification, "is_over_object", False)
+            st.video(
+                overlay_bytes,
+                format="video/mp4",
+                start_time=0,
+                autoplay=True,
+                muted=True,
+                loop=True,
+                width="stretch",
+            )
+        else:
+            st.warning("Could not render tracking video output.")
+
+        label_text = analysis.dunk_type if analysis.is_dunk else f"NOT A DUNK ({analysis.non_dunk_type})"
+        aux_text = analysis.primary_category if analysis.is_dunk else analysis.rejection_reason
         st.markdown(
             f'<div style="'
             f'text-align: center; margin: 1.5rem 0; padding: 1.5rem 1.75rem; '
             f'background: rgba(18,18,18,0.95); border: 1px solid rgba(255,255,255,0.08); '
             f'border-radius: 14px;'
             f'">'
-            f'<div style="font-size: 0.75rem; color: #666; margin-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.1em;">Classification (4 categories)</div>'
-            f'<div style="font-size: clamp(1.4rem, 3.5vw, 2rem); font-weight: 700; color: #fff; line-height: 1.35;">{classification.label}</div>'
-            f'<div style="font-size: 0.9rem; color: #aaa; margin-top: 0.5rem;">{classification.description}</div>'
+            f'<div style="font-size: 0.75rem; color: #666; margin-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.1em;">Classification Output</div>'
+            f'<div style="font-size: clamp(1.35rem, 3.4vw, 1.95rem); font-weight: 700; color: #fff; line-height: 1.35;">{label_text}</div>'
+            f'<div style="font-size: 0.9rem; color: #aaa; margin-top: 0.5rem;">{aux_text}</div>'
             f'<div style="display: flex; flex-wrap: wrap; justify-content: center; gap: 1rem; margin-top: 1rem; font-size: 0.85rem;">'
-            f'<span style="color: #888;">Rotation: <strong style="color: #ccc;">{rot_cat}</strong></span>'
-            f'<span style="color: #888;">Dunk type: <strong style="color: #ccc;">{dunk_t}</strong></span>'
-            f'<span style="color: #888;">Alley-oop: <strong style="color: #ccc;">{"Yes" if alley else "No"}</strong></span>'
-            f'<span style="color: #888;">Over object: <strong style="color: #ccc;">{"Yes" if over_obj else "No"}</strong></span>'
+            f'<span style="color: #888;">Primary category: <strong style="color: #ccc;">{analysis.primary_category}</strong></span>'
+            f'<span style="color: #888;">Alley-oop: <strong style="color: #ccc;">{"Yes" if analysis.alley_oop else "No"}</strong></span>'
+            f'<span style="color: #888;">Self-lob: <strong style="color: #ccc;">{"Yes" if analysis.self_lob else "No"}</strong></span>'
+            f'<span style="color: #888;">Rotation band: <strong style="color: #ccc;">{analysis.rotation_band}</strong></span>'
+            f'<span style="color: #888;">Over object: <strong style="color: #ccc;">{"Yes" if analysis.over_object else "No"}</strong></span>'
+            f'<span style="color: #888;">Model: <strong style="color: #ccc;">{analysis.model_prediction or "rule-only"} ({analysis.model_confidence:.2f})</strong></span>'
             f'</div></div>',
             unsafe_allow_html=True,
         )
-        with st.expander("Original clip (no overlay)"):
-            st.video(upload_bytes, format="video/mp4", start_time=0)
-
-        st.subheader("Key metrics")
+        st.subheader("Core output (requested fields)")
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("Hang time", f"{result.hang_time_s:.2f} s")
-            st.metric("Time in air", f"{result.hang_time_s:.2f} s")
+            st.metric("Hang time", f"{analysis.hang_time_s:.2f} s")
+            st.metric("Frames airborne", analysis.frames_airborne)
+            st.metric("Ball air time", f"{analysis.ball_air_time_s:.2f} s" if analysis.ball_air_time_s > 0 else "—")
         with col2:
-            st.metric("Max vertical", f"{result.max_vertical_inches:.1f} in")
-            st.metric("Frames airborne", result.frames_airborne)
+            st.metric("Max vertical", f"{analysis.max_vertical_inches:.1f} in")
+            st.metric("Apex height", f"{analysis.apex_height_ft:.2f} ft")
+            st.metric("Rotation", f"{analysis.rotation_degrees:.0f}°")
         with col3:
-            st.metric("Rotation", f"{result.rotation_degrees:.0f}°")
-            st.metric("Dunk type", breakdown.dunk_type)
+            st.metric("Dunk type", analysis.dunk_type if analysis.is_dunk else analysis.non_dunk_type)
+            st.metric("Difficulty tier", analysis.difficulty_tier)
+            st.metric("Style grade", analysis.style_grade)
         with col4:
-            st.metric("Score", f"{breakdown.final_score:.1f} / 50", None)
-            st.metric("Ball air time", f"{ball_air_time_s:.2f} s" if ball_air_time_s > 0 else "—")
-            st.metric("Lob / Alley-oop", f"+{breakdown.lob_bonus:.1f}" if breakdown.lob_bonus > 0 else "—")
-            st.caption("Base + hang / rot / height / lob")
-        if ball_air_time_s <= 0:
-            st.caption("Ball air time: no basketball detected (orange/red blob). Lob bonus needs visible ball.")
+            st.metric("Comparable tier", analysis.comparable_tier)
+            st.metric("Score", f"{analysis.final_contest_score:.1f} / 50")
+            st.metric("Alley-oop", "Yes" if analysis.alley_oop else "No")
+            st.metric("Model prediction", analysis.model_prediction or "rule-only")
 
-        st.subheader("Final score")
-        score_color = "#22c55e" if breakdown.final_score >= 47 else "#eab308" if breakdown.final_score >= 43 else "#71717a"
+        with st.expander("Detection diagnostics"):
+            st.caption("Pass/fail checks used by dunk validation.")
+            st.json(analysis.validation_checks)
+
+        st.subheader("Biomechanics + motion cues")
+        b1, b2, b3, b4, b5 = st.columns(5)
+        with b1:
+            st.metric("Takeoff feet", analysis.takeoff_foot_count)
+            st.metric("Takeoff distance", f"{analysis.takeoff_distance_ft:.1f} ft")
+        with b2:
+            st.metric("Approach speed", f"{analysis.approach_speed_ft_s:.1f} ft/s")
+            st.metric("Gather time", f"{analysis.gather_time_s:.2f} s")
+        with b3:
+            st.metric("Leg tuck angle", f"{analysis.leg_tuck_angle_deg:.0f}°")
+            st.metric("Shoulder flexion", f"{analysis.shoulder_flexion_angle_deg:.0f}°")
+        with b4:
+            st.metric("Elbow ext velocity", f"{analysis.elbow_extension_velocity_deg_s:.0f}°/s")
+            st.metric("Arm path curvature", f"{analysis.arm_path_curvature_deg:.0f}°")
+        with b5:
+            st.metric("Ball path arc", f"{analysis.ball_path_arc_ft:.2f} ft")
+            st.metric("Lob mode", analysis.lob_type)
+
+        st.subheader("Final contest score")
+        score_color = "#22c55e" if analysis.final_contest_score >= 47 else "#eab308" if analysis.final_contest_score >= 43 else "#71717a"
         st.markdown(
             f"""
             <div style="
@@ -315,71 +355,12 @@ def main():
                 border-radius: 14px;
                 background: rgba(0,0,0,0.3);
             ">
-                {breakdown.final_score:.1f}
+                {analysis.final_contest_score:.1f}
             </div>
             """,
             unsafe_allow_html=True,
         )
-        st.caption("40–50 contest scale · " + breakdown.dunk_type)
-
-        # Extra impressive metrics at bottom (smooth section)
-        st.markdown("---")
-        st.subheader("Deep dive metrics")
-        st.caption("Derived from pose and ball tracking — contest-style context.")
-        hang_s, vert_in, rot_deg = result.hang_time_s, result.max_vertical_inches, result.rotation_degrees
-        score = breakdown.final_score
-        # Style grade A–F from score (40→C, 50→A+)
-        if score >= 48:
-            style_grade, style_label = "A+", "Elite"
-        elif score >= 45:
-            style_grade, style_label = "A", "Contest winner tier"
-        elif score >= 42:
-            style_grade, style_label = "B+", "Final-round quality"
-        elif score >= 40:
-            style_grade, style_label = "B", "Solid contest dunk"
-        else:
-            style_grade, style_label = "C+", "Above average"
-        # Estimated apex (assume 6 ft standing reach + vertical)
-        apex_ft = (72 + vert_in) / 12.0
-        # Difficulty tier
-        if breakdown.base_score >= 32:
-            diff_tier = "Elite"
-        elif breakdown.base_score >= 28:
-            diff_tier = "High"
-        elif breakdown.base_score >= 24:
-            diff_tier = "Medium"
-        else:
-            diff_tier = "Standard"
-        # Comparable (historical 50s: Vince Carter 2000, Mac McClung 2024, etc.)
-        if score >= 48:
-            comp = "Vince Carter 2000 / Mac McClung 2024 tier"
-        elif score >= 45:
-            comp = "Contest finalist / Jordan '88 style"
-        elif score >= 42:
-            comp = "Strong contest first round"
-        else:
-            comp = "Solid in-game dunk"
-        # Hang time percentile (heuristic: 0.5s ≈ 50th, 0.7s ≈ 90th)
-        if hang_s >= 0.65:
-            hang_pct = "90th+"
-        elif hang_s >= 0.5:
-            hang_pct = "70th"
-        elif hang_s >= 0.4:
-            hang_pct = "50th"
-        else:
-            hang_pct = "30th"
-        col1, col2, col3, col4, col5 = st.columns(5)
-        with col1:
-            st.metric("Style grade", f"{style_grade}", style_label)
-        with col2:
-            st.metric("Est. apex reach", f"{apex_ft:.1f} ft", "standing + vertical")
-        with col3:
-            st.metric("Difficulty tier", diff_tier, "from dunk type")
-        with col4:
-            st.metric("Hang time tier", hang_pct, "vs. typical dunks")
-        with col5:
-            st.metric("Comparable to", comp, "contest history")
-        st.caption("Style grade and comparable based on NBA Slam Dunk Contest history (40–50 scale).")
+        st.caption("40–50 contest scale · ontology + biomechanics + rejection model")
 
     finally:
         try:

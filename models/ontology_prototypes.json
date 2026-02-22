@@ -1,0 +1,186 @@
+{
+  "version": 1,
+  "trained_at": "2026-02-22T06:57:31.683535+00:00",
+  "feature_keys": [
+    "rotation_degrees",
+    "hang_time_s",
+    "max_vertical_inches",
+    "left_wrist_sweep_deg",
+    "right_wrist_sweep_deg",
+    "wrist_below_hip",
+    "wrist_below_hip_midline",
+    "two_hands_cue",
+    "ball_air_time_s"
+  ],
+  "feature_scales": {
+    "rotation_degrees": 360.0,
+    "hang_time_s": 1.0,
+    "max_vertical_inches": 42.0,
+    "left_wrist_sweep_deg": 360.0,
+    "right_wrist_sweep_deg": 360.0,
+    "wrist_below_hip": 1.0,
+    "wrist_below_hip_midline": 1.0,
+    "two_hands_cue": 1.0,
+    "ball_air_time_s": 2.0
+  },
+  "feature_weights": {
+    "rotation_degrees": 1.4,
+    "hang_time_s": 0.9,
+    "max_vertical_inches": 1.1,
+    "left_wrist_sweep_deg": 1.0,
+    "right_wrist_sweep_deg": 1.0,
+    "wrist_below_hip": 1.2,
+    "wrist_below_hip_midline": 1.4,
+    "two_hands_cue": 1.0,
+    "ball_air_time_s": 0.7
+  },
+  "counts": {
+    "360 Dunk": 1,
+    "Alley-Oop 360": 1,
+    "Alley-Oop Power": 1,
+    "Behind-Back Dunk": 1,
+    "Double Eastbay": 1,
+    "Eastbay (Between-the-Legs)": 3,
+    "Free Throw Line Dunk": 1,
+    "180 Dunk": 2,
+    "Tomahawk (Single Arm)": 1,
+    "Two-Hand Power Dunk": 1,
+    "Standard Windmill": 3
+  },
+  "class_radii": {
+    "360 Dunk": 0.18,
+    "Alley-Oop 360": 0.18,
+    "Alley-Oop Power": 0.18,
+    "Behind-Back Dunk": 0.18,
+    "Double Eastbay": 0.18,
+    "Eastbay (Between-the-Legs)": 1.168684476949628,
+    "Free Throw Line Dunk": 0.18,
+    "180 Dunk": 1.1985804879391018,
+    "Tomahawk (Single Arm)": 0.18,
+    "Two-Hand Power Dunk": 0.18,
+    "Standard Windmill": 1.8687620944193455
+  },
+  "prototypes": {
+    "360 Dunk": {
+      "rotation_degrees": 20.395099558617318,
+      "hang_time_s": 3.6,
+      "max_vertical_inches": 42.63718323401483,
+      "left_wrist_sweep_deg": 280.02969797401727,
+      "right_wrist_sweep_deg": 175.6919764970619,
+      "wrist_below_hip": 1.0,
+      "wrist_below_hip_midline": 0.0,
+      "two_hands_cue": 1.0,
+      "ball_air_time_s": 5.2
+    },
+    "Alley-Oop 360": {
+      "rotation_degrees": 251.97604816239237,
+      "hang_time_s": 1.7333333333333332,
+      "max_vertical_inches": 205.45745462089113,
+      "left_wrist_sweep_deg": 8.203915319255259,
+      "right_wrist_sweep_deg": 27.9711309897164,
+      "wrist_below_hip": 1.0,
+      "wrist_below_hip_midline": 0.0,
+      "two_hands_cue": 1.0,
+      "ball_air_time_s": 3.5
+    },
+    "Alley-Oop Power": {
+      "rotation_degrees": 8.311427364255906,
+      "hang_time_s": 2.8,
+      "max_vertical_inches": 27.07239929232996,
+      "left_wrist_sweep_deg": 370.0737969854457,
+      "right_wrist_sweep_deg": 8.055953727014668,
+      "wrist_below_hip": 1.0,
+      "wrist_below_hip_midline": 0.0,
+      "two_hands_cue": 1.0,
+      "ball_air_time_s": 4.533333333333333
+    },
+    "Behind-Back Dunk": {
+      "rotation_degrees": 16.957097371992717,
+      "hang_time_s": 5.8,
+      "max_vertical_inches": 25.438916738891056,
+      "left_wrist_sweep_deg": 28.046217927648158,
+      "right_wrist_sweep_deg": 135.52907189218354,
+      "wrist_below_hip": 1.0,
+      "wrist_below_hip_midline": 1.0,
+      "two_hands_cue": 1.0,
+      "ball_air_time_s": 5.766666666666667
+    },
+    "Double Eastbay": {
+      "rotation_degrees": 225.80679774531964,
+      "hang_time_s": 3.5,
+      "max_vertical_inches": 28.637619412081527,
+      "left_wrist_sweep_deg": 0.0,
+      "right_wrist_sweep_deg": 108.14016009809336,
+      "wrist_below_hip": 1.0,
+      "wrist_below_hip_midline": 0.0,
+      "two_hands_cue": 0.0,
+      "ball_air_time_s": 0.733333333333333
+    },
+    "Eastbay (Between-the-Legs)": {
+      "rotation_degrees": 33.52571248464884,
+      "hang_time_s": 1.1530666666666665,
+      "max_vertical_inches": 25.607680916162682,
+      "left_wrist_sweep_deg": 28.05039096956358,
+      "right_wrist_sweep_deg": 106.93726121008588,
+      "wrist_below_hip": 1.0,
+      "wrist_below_hip_midline": 0.6666666666666666,
+      "two_hands_cue": 0.6666666666666666,
+      "ball_air_time_s": 1.960977777777778
+    },
+    "Free Throw Line Dunk": {
+      "rotation_degrees": 167.4539829609341,
+      "hang_time_s": 2.491869918699187,
+      "max_vertical_inches": 78.94802802391226,
+      "left_wrist_sweep_deg": 45.41027981292261,
+      "right_wrist_sweep_deg": 333.15479011787335,
+      "wrist_below_hip": 1.0,
+      "wrist_below_hip_midline": 0.0,
+      "two_hands_cue": 1.0,
+      "ball_air_time_s": 4.053441734417344
+    },
+    "180 Dunk": {
+      "rotation_degrees": 243.87232491448054,
+      "hang_time_s": 2.4601308411214955,
+      "max_vertical_inches": 24.86143231523152,
+      "left_wrist_sweep_deg": 220.54658289382945,
+      "right_wrist_sweep_deg": 224.47911933541747,
+      "wrist_below_hip": 0.5,
+      "wrist_below_hip_midline": 0.0,
+      "two_hands_cue": 1.0,
+      "ball_air_time_s": 3.523757009345794
+    },
+    "Tomahawk (Single Arm)": {
+      "rotation_degrees": 26.488625607396244,
+      "hang_time_s": 3.1666666666666665,
+      "max_vertical_inches": 38.57118398804681,
+      "left_wrist_sweep_deg": 96.50159457725131,
+      "right_wrist_sweep_deg": 341.82262089617666,
+      "wrist_below_hip": 1.0,
+      "wrist_below_hip_midline": 0.0,
+      "two_hands_cue": 1.0,
+      "ball_air_time_s": 4.566666666666666
+    },
+    "Two-Hand Power Dunk": {
+      "rotation_degrees": 23.400859572245224,
+      "hang_time_s": 5.533333333333333,
+      "max_vertical_inches": 45.44786324393194,
+      "left_wrist_sweep_deg": 54.26706959040622,
+      "right_wrist_sweep_deg": 180.1187426247199,
+      "wrist_below_hip": 1.0,
+      "wrist_below_hip_midline": 0.0,
+      "two_hands_cue": 1.0,
+      "ball_air_time_s": 4.7
+    },
+    "Standard Windmill": {
+      "rotation_degrees": 43.59731440831024,
+      "hang_time_s": 1.5888888888888888,
+      "max_vertical_inches": 74.82328855604014,
+      "left_wrist_sweep_deg": 229.90622483893404,
+      "right_wrist_sweep_deg": 184.59125161829317,
+      "wrist_below_hip": 0.6666666666666666,
+      "wrist_below_hip_midline": 0.6666666666666666,
+      "two_hands_cue": 0.6666666666666666,
+      "ball_air_time_s": 2.788888888888889
+    }
+  }
+}

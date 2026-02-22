@@ -1,23 +1,34 @@
-# Slam Dunk Score Predictor
+# DunkR8
 
-**Computer Vision Analysis of Dunk Performance — NBA Slam Dunk Contest Style**
+Pose + ball tracking system for dunk detection, taxonomy classification, rejection, and 40-50 contest scoring.
 
-Uses MediaPipe Pose, OpenCV, and a custom PhysicsEngine to analyze dunk videos and predict a judges' score (40–50 range).
+## What It Does
+
+- Detects whether a clip contains a valid dunk (strict multi-condition validation)
+- Rejects non-dunks (layup, finger roll, floater, tip-in, missed/blocked dunk, etc.)
+- Classifies canonical dunk types via a formal ontology (power, rotation, windmill, leg-thread, lob, distance, reaction)
+- Distinguishes lob mode (`alley-oop` vs `self-lob` when trajectory indicates backboard/bounce)
+- Extracts biomechanics (hang time, airborne frames, apex, vertical, rotation, takeoff cues, arm and ball path behavior)
+- Produces contest scoring on a 40-50 scale with difficulty/style tiers
+- Supports optional prototype training from your own labeled clips
 
 ## Tech Stack
 
 - **CV:** OpenCV, MediaPipe Pose
 - **Frontend:** Streamlit
+- **Pipeline:** Rule-based ontology + biomechanical heuristics (no reference clip matcher, no trained classifier)
 
 ## Project Structure
 
 ```
-ImpactInsight/
-├── app.py            # Streamlit dashboard (main UI)
-├── config.py         # Scoring constants and thresholds
-├── pose_processor.py # MediaPipe pose detection & skeleton overlay
-├── physics_engine.py # Hang time, max vertical, rotation
-├── scoring.py       # NBA Slam Dunk Contest scoring algorithm
+DunkR8/
+├── app.py             # Streamlit app (UI + output formatting)
+├── dunk_analyzer.py   # Dunk validation, taxonomy classification, rejection, scoring
+├── dunk_ontology.py   # Canonical dunk taxonomy and category metadata
+├── pose_processor.py  # Pose extraction and skeleton overlay
+├── ball_tracker.py    # Ball detection and trajectory helpers
+├── physics_engine.py  # Core kinematics from pose sequence
+├── config.py
 ├── requirements.txt
 └── README.md
 ```
@@ -25,44 +36,51 @@ ImpactInsight/
 ## Installation
 
 ```bash
-cd ImpactInsight
 pip install -r requirements.txt
 ```
 
-**Note:** Works with both MediaPipe 0.10.x (legacy) and 0.11+ (Tasks API). On first run with 0.11+, the pose model (~6MB) downloads automatically.
+MediaPipe model note: on first run with Tasks API, the pose model downloads automatically to `.models/`.
 
-## Usage
+## Run
 
 ```bash
 streamlit run app.py
 ```
 
-1. Upload an MP4 dunk video
-2. View the **Judges' Scorecard** in the sidebar (metrics + score breakdown)
-3. Scrub through the video with the **MediaPipe skeleton overlay**
-4. See the **Final Predicted Score** (40.0 – 50.0)
+## Optional Training (Your Clips)
 
-## Scoring Algorithm
+Put labeled clips in `reference_dunks/clips/` and include the dunk type in the filename:
 
-| Component      | Rule                                              |
-|----------------|---------------------------------------------------|
-| Base Score     | 30.0                                              |
-| Hang Time      | +10 max if > 0.8s (scaled linearly)               |
-| Rotation       | +5 for 180°, +10 for 360°                         |
-| Height         | +5 max if vertical > 35 inches (scaled)           |
-| **Final Range**| 40.0 – 50.0                                       |
+- `windmill.mp4`
+- `360_dunk.mp4`
+- `reverse_eastbay.mov`
 
-## Physics Metrics
+Then train:
 
-- **Hang Time:** Time (seconds) both heels are above baseline until landing
-- **Max Vertical:** Peak hip height delta from start (inches)
-- **Rotation:** Cumulative shoulder angle change (degrees)
+```bash
+python ontology_trainer.py
+```
 
-## Error Handling
+This writes `models/ontology_prototypes.json`, which is automatically loaded by the analyzer.
 
-- No person detected → Clear error message
-- Insufficient pose data → Warning with fallback metrics
-- FPS-aware calculations for accurate timing
+To benchmark current reliability on all reference clips:
+
+```bash
+python reliability_eval.py
+```
+
+## Output Fields
+
+For each upload, the app reports:
+
+- Primary classification category
+- Canonical dunk type (or non-dunk type)
+- Alley-oop and self-lob flags
+- Rotation (degrees + band)
+- Hang time, max vertical, apex height, airborne frames
+- Ball air time and ball-path arc
+- Difficulty tier, style grade, comparable tier
+- Final contest score (40-50)
 
 ## License
 

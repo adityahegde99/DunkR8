@@ -18,8 +18,14 @@ class PoseFrame:
     right_shoulder: Optional[Tuple[float, float]]
     timestamp_s: float
     body_height_norm: Optional[float] = None
+    mid_hip_x: Optional[float] = None
+    nose: Optional[Tuple[float, float]] = None
     left_hip: Optional[Tuple[float, float]] = None
     right_hip: Optional[Tuple[float, float]] = None
+    left_knee: Optional[Tuple[float, float]] = None
+    right_knee: Optional[Tuple[float, float]] = None
+    left_ankle: Optional[Tuple[float, float]] = None
+    right_ankle: Optional[Tuple[float, float]] = None
     left_elbow: Optional[Tuple[float, float]] = None
     right_elbow: Optional[Tuple[float, float]] = None
     left_wrist: Optional[Tuple[float, float]] = None
@@ -35,6 +41,15 @@ class PhysicsResult:
     frames_airborne: int
     start_hip_y: float
     min_hip_y: float
+    airborne_start_frame_idx: int = -1
+    airborne_end_frame_idx: int = -1
+    airborne_start_timestamp_s: float = 0.0
+    airborne_end_timestamp_s: float = 0.0
+    apex_frame_idx: int = -1
+    apex_timestamp_s: float = 0.0
+    apex_height_ft: float = 0.0
+    estimated_vertical_leap_inches: float = 0.0
+    ground_threshold_y: float = 0.0
     # Arm movement (for windmill / Eastbay / two-hand)
     left_wrist_angle_sweep_deg: float = 0.0
     right_wrist_angle_sweep_deg: float = 0.0
@@ -105,7 +120,7 @@ class PhysicsEngine:
         if len(valid) < 5:
             return None
 
-        # Ground level: 95th percentile of foot y (when feet are lowest = on ground)
+        # Ground level: percentile of foot y (when feet are lowest = on ground)
         all_foot_ys = []
         for p in valid:
             all_foot_ys.append(p.left_heel_y)
@@ -113,10 +128,14 @@ class PhysicsEngine:
         all_foot_ys.sort(reverse=True)
         idx_95 = max(0, int(len(all_foot_ys) * 0.05) - 1)
         baseline_y = all_foot_ys[idx_95] if all_foot_ys else 0.9
-        # Airborne = both feet above this line (lower y = higher in frame)
+        # Foot-based airborne threshold (lower y = higher in frame)
         threshold_y = baseline_y - 0.04
+        # Hip-based fallback keeps airborne state robust when one foot landmark flickers.
+        hip_vals = [p.mid_hip_y for p in valid if p.mid_hip_y is not None]
+        hip_baseline_y = max(hip_vals) if hip_vals else 0.7
+        hip_air_threshold = hip_baseline_y - 0.03
 
-        # Find airborne intervals: both heels above threshold; keep best segment for arm metrics
+        # Find airborne intervals using both foot and hip cues.
         airborne_start: Optional[int] = None
         airborne_end: Optional[int] = None
         max_airborne_duration = 0.0
@@ -126,9 +145,11 @@ class PhysicsEngine:
         while i < len(valid):
             p = valid[i]
             both_above = p.left_heel_y < threshold_y and p.right_heel_y < threshold_y
-            if both_above and airborne_start is None:
+            hip_high = p.mid_hip_y is not None and p.mid_hip_y < hip_air_threshold
+            airborne_like = both_above or hip_high
+            if airborne_like and airborne_start is None:
                 airborne_start = i
-            elif not both_above and airborne_start is not None:
+            elif not airborne_like and airborne_start is not None:
                 airborne_end = i - 1
                 start_ts = valid[airborne_start].timestamp_s
                 end_ts = valid[airborne_end].timestamp_s
@@ -150,6 +171,18 @@ class PhysicsEngine:
 
         hang_time_s = max_airborne_duration
         airborne_frames_for_arms = valid[best_start : best_end + 1] if max_airborne_duration > 0 else []
+        airborne_start_frame_idx = (
+            airborne_frames_for_arms[0].frame_idx if airborne_frames_for_arms else -1
+        )
+        airborne_end_frame_idx = (
+            airborne_frames_for_arms[-1].frame_idx if airborne_frames_for_arms else -1
+        )
+        airborne_start_timestamp_s = (
+            airborne_frames_for_arms[0].timestamp_s if airborne_frames_for_arms else 0.0
+        )
+        airborne_end_timestamp_s = (
+            airborne_frames_for_arms[-1].timestamp_s if airborne_frames_for_arms else 0.0
+        )
 
         # Rim-touch frame: peak height in airborne segment (hands touch rim there); rotation counts only jump -> rim touch
         rim_touch_end_idx = len(airborne_frames_for_arms) - 1
@@ -173,6 +206,20 @@ class PhysicsEngine:
         delta_pixels = delta_normalized * self.frame_height
         max_vertical_inches = self._pixel_delta_to_inches(delta_pixels)
         max_vertical_inches = max(0.0, max_vertical_inches)
+        apex_height_ft = (72.0 + max_vertical_inches) / 12.0
+        estimated_vertical_leap_inches = max_vertical_inches
+
+        apex_frame_idx = -1
+        apex_timestamp_s = 0.0
+        if airborne_frames_for_arms:
+            apex_frame = min(
+                (p for p in airborne_frames_for_arms if p.mid_hip_y is not None),
+                key=lambda p: p.mid_hip_y,
+                default=None,
+            )
+            if apex_frame is not None:
+                apex_frame_idx = apex_frame.frame_idx
+                apex_timestamp_s = apex_frame.timestamp_s
 
         # Rotation: from jump to rim touch only (not after hands touch rim)
         shoulder_frames = [
@@ -293,6 +340,15 @@ class PhysicsEngine:
             frames_airborne=frames_airborne,
             start_hip_y=start_hip_y,
             min_hip_y=min_hip_y,
+            airborne_start_frame_idx=airborne_start_frame_idx,
+            airborne_end_frame_idx=airborne_end_frame_idx,
+            airborne_start_timestamp_s=airborne_start_timestamp_s,
+            airborne_end_timestamp_s=airborne_end_timestamp_s,
+            apex_frame_idx=apex_frame_idx,
+            apex_timestamp_s=apex_timestamp_s,
+            apex_height_ft=apex_height_ft,
+            estimated_vertical_leap_inches=estimated_vertical_leap_inches,
+            ground_threshold_y=threshold_y,
             left_wrist_angle_sweep_deg=left_sweep,
             right_wrist_angle_sweep_deg=right_sweep,
             wrist_went_below_hip=wrist_below_hip,

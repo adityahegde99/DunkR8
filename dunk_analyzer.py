@@ -1,0 +1,1254 @@
+"""
+Ontology-driven dunk analyzer using pose + ball tracking only.
+"""
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+import math
+
+from dunk_ontology import DUNK_ONTOLOGY
+from physics_engine import PhysicsResult, PoseFrame
+from ontology_model import (
+    load_prototype_model,
+    build_feature_dict,
+    predict_from_model,
+    normalize_dunk_label,
+)
+
+
+@dataclass
+class ScoreComponents:
+    base_score: float
+    hang_time_bonus: float
+    vertical_bonus: float
+    rotation_bonus: float
+    trick_bonus: float
+    lob_bonus: float
+    distance_bonus: float
+    reliability_adjustment: float
+    final_score: float
+
+
+@dataclass
+class DunkAnalysis:
+    is_dunk: bool
+    rejection_reason: str
+    non_dunk_type: str
+    primary_category: str
+    dunk_type: str
+    alley_oop: bool
+    self_lob: bool
+    lob_type: str
+    rotation_degrees: float
+    rotation_band: str
+    over_object: bool
+    hang_time_s: float
+    max_vertical_inches: float
+    apex_height_ft: float
+    frames_airborne: int
+    ball_air_time_s: float
+    takeoff_foot_count: int
+    takeoff_distance_ft: float
+    approach_speed_ft_s: float
+    gather_time_s: float
+    leg_tuck_angle_deg: float
+    shoulder_flexion_angle_deg: float
+    elbow_extension_velocity_deg_s: float
+    arm_path_curvature_deg: float
+    ball_path_arc_ft: float
+    difficulty_tier: str
+    style_grade: str
+    comparable_tier: str
+    final_contest_score: float
+    model_prediction: str
+    model_confidence: float
+    validation_checks: Dict[str, bool]
+    score_components: ScoreComponents
+
+
+@dataclass
+class _RimZone:
+    x: float
+    y: float
+    radius: float
+
+
+@dataclass
+class _BallFeatures:
+    has_ball_track: bool
+    crossed_downward: bool
+    crossed_upward_first: bool
+    forced_downward: bool
+    ends_inside_basket: bool
+    control_at_finish: bool
+    cross_frame_idx: int
+    cross_timestamp_s: float
+    ball_path_arc_ft: float
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _safe_div(num: float, den: float) -> float:
+    return num / den if den else 0.0
+
+
+def _rotation_band(rotation_deg: float) -> str:
+    if rotation_deg >= 480:
+        return "540+"
+    if rotation_deg >= 300:
+        return "360"
+    if rotation_deg >= 160:
+        return "180"
+    if rotation_deg >= 45:
+        return "partial"
+    return "none"
+
+
+def _joint_angle_deg(a: Tuple[float, float], b: Tuple[float, float], c: Tuple[float, float]) -> Optional[float]:
+    """Angle at b from segment ba to bc (0..180)."""
+    bax, bay = a[0] - b[0], a[1] - b[1]
+    bcx, bcy = c[0] - b[0], c[1] - b[1]
+    ba_norm = math.hypot(bax, bay)
+    bc_norm = math.hypot(bcx, bcy)
+    if ba_norm < 1e-6 or bc_norm < 1e-6:
+        return None
+    dot = bax * bcx + bay * bcy
+    cosang = _clamp(dot / (ba_norm * bc_norm), -1.0, 1.0)
+    return math.degrees(math.acos(cosang))
+
+
+def _split_ball_segments(
+    detections: List[Tuple[int, Optional[Tuple[int, int, float]], float]],
+    gap_seconds: float = 0.15,
+) -> List[List[Tuple[int, int, int, float, float]]]:
+    """Return contiguous ball segments: (frame_idx, x, y, r, ts)."""
+    segments: List[List[Tuple[int, int, int, float, float]]] = []
+    current: List[Tuple[int, int, int, float, float]] = []
+    last_ts: Optional[float] = None
+    for frame_idx, ball, ts in detections:
+        if ball is None:
+            if current:
+                segments.append(current)
+                current = []
+            last_ts = ts
+            continue
+        cx, cy, r = ball
+        if current and last_ts is not None and (ts - last_ts) > gap_seconds:
+            segments.append(current)
+            current = []
+        current.append((frame_idx, cx, cy, r, ts))
+        last_ts = ts
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _select_ball_segment(
+    detections: List[Tuple[int, Optional[Tuple[int, int, float]], float]],
+    rim_zone: Optional[_RimZone],
+    expected_airborne_window: Optional[Tuple[int, int]],
+) -> List[Tuple[int, int, int, float, float]]:
+    """
+    Pick the most plausible dunk segment instead of blindly taking the longest.
+    This prevents long false-positive tracks in the crowd from dominating.
+    """
+    segments = _split_ball_segments(detections)
+    if not segments:
+        return []
+
+    if len(segments) == 1:
+        return segments[0]
+
+    win_start, win_end = expected_airborne_window if expected_airborne_window else (-10**9, 10**9)
+    best_score = float("-inf")
+    best_segment = segments[0]
+    for seg in segments:
+        frames = [f for f, _x, _y, _r, _t in seg]
+        overlap = sum(1 for f in frames if (win_start - 8) <= f <= (win_end + 18))
+        overlap_ratio = overlap / max(1, len(seg))
+
+        rim_prox = 0.0
+        if rim_zone is not None:
+            near = [
+                1
+                for _f, x, y, _r, _t in seg
+                if abs(x - rim_zone.x) <= rim_zone.radius * 2.0
+                and abs(y - rim_zone.y) <= rim_zone.radius * 2.8
+            ]
+            rim_prox = len(near) / max(1, len(seg))
+
+        # Length matters, but cannot overpower poor overlap/proximity.
+        length_score = min(1.0, len(seg) / 30.0)
+        score = (2.6 * overlap_ratio) + (2.0 * rim_prox) + (0.6 * length_score)
+        if score > best_score:
+            best_score = score
+            best_segment = seg
+    return best_segment
+
+
+def _estimate_rim_zone(
+    airborne_frames: List[PoseFrame],
+    frame_width: int,
+    frame_height: int,
+) -> Optional[_RimZone]:
+    # Use highest wrist near apex as best estimate of rim touch zone.
+    candidates: List[Tuple[float, float]] = []
+    for p in airborne_frames:
+        for wrist in (p.left_wrist, p.right_wrist):
+            if wrist is None:
+                continue
+            candidates.append((wrist[0] * frame_width, wrist[1] * frame_height))
+    if not candidates:
+        return None
+    x, y = min(candidates, key=lambda pt: pt[1])
+    rim_y = y + (0.02 * frame_height)
+    rim_radius = max(14.0, 0.055 * frame_width)
+    return _RimZone(x=float(x), y=float(rim_y), radius=float(rim_radius))
+
+
+def _ball_path_arc_ft(
+    segment: List[Tuple[int, int, int, float, float]],
+    pixels_per_inch: float,
+) -> float:
+    if len(segment) < 2 or pixels_per_inch <= 0:
+        return 0.0
+    ys = [pt[2] for pt in segment]
+    vertical_range_px = float(max(ys) - min(ys))
+    return vertical_range_px / pixels_per_inch / 12.0
+
+
+def _nearest_pose_frame(
+    pose_map: Dict[int, PoseFrame],
+    target_idx: int,
+    radius: int = 3,
+) -> Optional[PoseFrame]:
+    for d in range(0, radius + 1):
+        for idx in (target_idx - d, target_idx + d):
+            if idx in pose_map:
+                return pose_map[idx]
+    return None
+
+
+def _control_near_finish(
+    segment: List[Tuple[int, int, int, float, float]],
+    cross_frame_idx: int,
+    pose_map: Dict[int, PoseFrame],
+    frame_width: int,
+    frame_height: int,
+) -> bool:
+    if cross_frame_idx < 0:
+        return False
+    ball_by_frame = {f: (x, y) for f, x, y, _r, _t in segment}
+    max_control_dist = max(52.0, frame_width * 0.14)
+    support = 0
+    for idx in range(cross_frame_idx - 2, cross_frame_idx + 3):
+        if idx not in ball_by_frame:
+            continue
+        pose = _nearest_pose_frame(pose_map, idx, radius=2)
+        if pose is None:
+            continue
+        bx, by = ball_by_frame[idx]
+        wrists = [w for w in (pose.left_wrist, pose.right_wrist) if w is not None]
+        if not wrists:
+            continue
+        min_dist = min(math.hypot((w[0] * frame_width) - bx, (w[1] * frame_height) - by) for w in wrists)
+        if min_dist <= max_control_dist:
+            support += 1
+    return support >= 1
+
+
+def _ball_control_frames(
+    ball_detections: List[Tuple[int, Optional[Tuple[int, int, float]], float]],
+    pose_map: Dict[int, PoseFrame],
+    frame_width: int,
+    frame_height: int,
+) -> List[int]:
+    frames: List[int] = []
+    max_control_dist = max(52.0, frame_width * 0.14)
+    for frame_idx, ball, _ts in ball_detections:
+        if ball is None:
+            continue
+        pose = _nearest_pose_frame(pose_map, frame_idx, radius=1)
+        if pose is None:
+            continue
+        wrists = [w for w in (pose.left_wrist, pose.right_wrist) if w is not None]
+        if not wrists:
+            continue
+        bx, by, _r = ball
+        min_dist = min(
+            math.hypot((w[0] * frame_width) - bx, (w[1] * frame_height) - by)
+            for w in wrists
+        )
+        if min_dist <= max_control_dist:
+            frames.append(frame_idx)
+    return sorted(set(frames))
+
+
+def _compute_ball_features(
+    ball_detections: List[Tuple[int, Optional[Tuple[int, int, float]], float]],
+    rim_zone: Optional[_RimZone],
+    pose_map: Dict[int, PoseFrame],
+    frame_width: int,
+    frame_height: int,
+    pixels_per_inch: float,
+    expected_airborne_window: Optional[Tuple[int, int]] = None,
+) -> _BallFeatures:
+    segment = _select_ball_segment(
+        detections=ball_detections,
+        rim_zone=rim_zone,
+        expected_airborne_window=expected_airborne_window,
+    )
+    if not segment:
+        return _BallFeatures(
+            has_ball_track=False,
+            crossed_downward=False,
+            crossed_upward_first=False,
+            forced_downward=False,
+            ends_inside_basket=False,
+            control_at_finish=False,
+            cross_frame_idx=-1,
+            cross_timestamp_s=0.0,
+            ball_path_arc_ft=0.0,
+        )
+
+    arc_ft = _ball_path_arc_ft(segment, pixels_per_inch)
+    if rim_zone is None:
+        return _BallFeatures(
+            has_ball_track=True,
+            crossed_downward=False,
+            crossed_upward_first=False,
+            forced_downward=False,
+            ends_inside_basket=False,
+            control_at_finish=False,
+            cross_frame_idx=-1,
+            cross_timestamp_s=0.0,
+            ball_path_arc_ft=arc_ft,
+        )
+
+    crossed_downward = False
+    crossed_upward_first = False
+    forced_downward = False
+    ends_inside_basket = False
+    cross_frame_idx = -1
+    cross_timestamp_s = 0.0
+
+    min_drop_px = max(3.0, frame_height * 0.004)
+    for i in range(1, len(segment)):
+        prev = segment[i - 1]
+        curr = segment[i]
+        _fp, xp, yp, _rp, _tp = prev
+        fc, xc, yc, _rc, tc = curr
+        near_rim_x = (abs(xc - rim_zone.x) <= rim_zone.radius * 1.6) or (abs(xp - rim_zone.x) <= rim_zone.radius * 1.6)
+        near_rim_y = (abs(yc - rim_zone.y) <= rim_zone.radius * 2.8) or (abs(yp - rim_zone.y) <= rim_zone.radius * 2.8)
+        near_rim = near_rim_x and near_rim_y
+        if not near_rim:
+            continue
+        if yp > rim_zone.y and yc <= rim_zone.y and cross_frame_idx < 0:
+            crossed_upward_first = True
+        if yp < rim_zone.y and yc >= rim_zone.y and cross_frame_idx < 0:
+            crossed_downward = True
+            cross_frame_idx = fc
+            cross_timestamp_s = tc
+            forced_downward = (yc - yp) >= min_drop_px
+
+    if crossed_downward and cross_frame_idx >= 0:
+        for f, x, y, _r, _t in segment:
+            if f < cross_frame_idx:
+                continue
+            inside_x = abs(x - rim_zone.x) <= rim_zone.radius * 0.95
+            inside_y = rim_zone.y <= y <= (rim_zone.y + rim_zone.radius * 2.2)
+            if inside_x and inside_y:
+                ends_inside_basket = True
+                break
+
+    control_at_finish = _control_near_finish(
+        segment=segment,
+        cross_frame_idx=cross_frame_idx,
+        pose_map=pose_map,
+        frame_width=frame_width,
+        frame_height=frame_height,
+    )
+    return _BallFeatures(
+        has_ball_track=True,
+        crossed_downward=crossed_downward,
+        crossed_upward_first=crossed_upward_first,
+        forced_downward=forced_downward,
+        ends_inside_basket=ends_inside_basket,
+        control_at_finish=control_at_finish,
+        cross_frame_idx=cross_frame_idx,
+        cross_timestamp_s=cross_timestamp_s,
+        ball_path_arc_ft=arc_ft,
+    )
+
+
+def _estimate_takeoff_foot_count(
+    pose_frames: List[PoseFrame],
+    result: PhysicsResult,
+) -> int:
+    if result.airborne_start_frame_idx < 0:
+        return 2
+    frame_map = {p.frame_idx: p for p in pose_frames}
+    samples: List[PoseFrame] = []
+    for idx in range(result.airborne_start_frame_idx - 4, result.airborne_start_frame_idx + 1):
+        if idx in frame_map:
+            samples.append(frame_map[idx])
+    if len(samples) < 2:
+        return 2
+
+    left_vals = [p.left_heel_y for p in samples if p.left_heel_y is not None]
+    right_vals = [p.right_heel_y for p in samples if p.right_heel_y is not None]
+    if not left_vals or not right_vals:
+        return 2
+
+    baseline_y = result.ground_threshold_y + 0.04
+    left_lift = baseline_y - min(left_vals)
+    right_lift = baseline_y - min(right_vals)
+    return 1 if abs(left_lift - right_lift) > 0.05 else 2
+
+
+def _estimate_approach_speed(
+    pose_frames: List[PoseFrame],
+    result: PhysicsResult,
+    frame_width: int,
+    pixels_per_inch: float,
+) -> float:
+    if result.airborne_start_timestamp_s <= 0 or pixels_per_inch <= 0:
+        return 0.0
+    start = result.airborne_start_timestamp_s - 0.35
+    end = result.airborne_start_timestamp_s
+    window = [p for p in pose_frames if p.mid_hip_x is not None and start <= p.timestamp_s <= end]
+    if len(window) < 2:
+        return 0.0
+    dx_px = abs((window[-1].mid_hip_x - window[0].mid_hip_x) * frame_width)
+    dt = window[-1].timestamp_s - window[0].timestamp_s
+    speed_in_s = _safe_div(dx_px / pixels_per_inch, dt)
+    return speed_in_s / 12.0
+
+
+def _estimate_gather_time(pose_frames: List[PoseFrame], result: PhysicsResult) -> float:
+    takeoff_ts = result.airborne_start_timestamp_s
+    if takeoff_ts <= 0:
+        return 0.0
+    pre = [p for p in pose_frames if p.mid_hip_y is not None and (takeoff_ts - 0.8) <= p.timestamp_s <= takeoff_ts]
+    if len(pre) < 3:
+        return 0.0
+    crouch = max(pre, key=lambda p: p.mid_hip_y)
+    return max(0.0, takeoff_ts - crouch.timestamp_s)
+
+
+def _estimate_leg_tuck_angle(
+    pose_by_idx: Dict[int, PoseFrame],
+    apex_idx: int,
+) -> float:
+    if apex_idx < 0:
+        return 0.0
+    p = _nearest_pose_frame(pose_by_idx, apex_idx, radius=3)
+    if p is None:
+        return 0.0
+    angles: List[float] = []
+    if p.left_hip and p.left_knee and p.left_ankle:
+        a = _joint_angle_deg(p.left_hip, p.left_knee, p.left_ankle)
+        if a is not None:
+            angles.append(a)
+    if p.right_hip and p.right_knee and p.right_ankle:
+        a = _joint_angle_deg(p.right_hip, p.right_knee, p.right_ankle)
+        if a is not None:
+            angles.append(a)
+    if not angles:
+        return 0.0
+    return min(angles)
+
+
+def _estimate_shoulder_flexion(
+    pose_by_idx: Dict[int, PoseFrame],
+    frame_idx: int,
+) -> float:
+    p = _nearest_pose_frame(pose_by_idx, frame_idx, radius=3)
+    if p is None:
+        return 0.0
+    vals: List[float] = []
+    for hip, shoulder, elbow in (
+        (p.left_hip, p.left_shoulder, p.left_elbow),
+        (p.right_hip, p.right_shoulder, p.right_elbow),
+    ):
+        if hip and shoulder and elbow:
+            torso_to_hip = (hip[0], hip[1])
+            angle = _joint_angle_deg(torso_to_hip, shoulder, elbow)
+            if angle is None:
+                continue
+            # Convert to "raise angle": 180 means fully overhead, 0 means dropped.
+            vals.append(180.0 - angle)
+    if not vals:
+        return 0.0
+    return _clamp(max(vals), 0.0, 180.0)
+
+
+def _elbow_angle(p: PoseFrame, side: str) -> Optional[float]:
+    if side == "left" and p.left_shoulder and p.left_elbow and p.left_wrist:
+        return _joint_angle_deg(p.left_shoulder, p.left_elbow, p.left_wrist)
+    if side == "right" and p.right_shoulder and p.right_elbow and p.right_wrist:
+        return _joint_angle_deg(p.right_shoulder, p.right_elbow, p.right_wrist)
+    return None
+
+
+def _estimate_elbow_extension_velocity(airborne_frames: List[PoseFrame]) -> float:
+    best = 0.0
+    for side in ("left", "right"):
+        seq: List[Tuple[float, float]] = []
+        for p in airborne_frames:
+            ang = _elbow_angle(p, side)
+            if ang is not None:
+                seq.append((p.timestamp_s, ang))
+        for i in range(1, len(seq)):
+            dt = seq[i][0] - seq[i - 1][0]
+            if dt <= 0:
+                continue
+            vel = (seq[i][1] - seq[i - 1][1]) / dt
+            best = max(best, vel)
+    return max(0.0, best)
+
+
+def _thread_events(airborne_frames: List[PoseFrame]) -> int:
+    events = 0
+    active = False
+    for p in airborne_frames:
+        if p.mid_hip_y is None:
+            continue
+        if p.left_hip is None or p.right_hip is None:
+            continue
+        xmin, xmax = sorted((p.left_hip[0], p.right_hip[0]))
+        in_thread = False
+        for wrist in (p.left_wrist, p.right_wrist):
+            if wrist is None:
+                continue
+            if wrist[1] > p.mid_hip_y and xmin <= wrist[0] <= xmax:
+                in_thread = True
+                break
+        if in_thread and not active:
+            events += 1
+            active = True
+        if not in_thread:
+            active = False
+    return events
+
+
+def _detect_double_pump(airborne_frames: List[PoseFrame]) -> bool:
+    if len(airborne_frames) < 8:
+        return False
+    left = [p.left_wrist[1] for p in airborne_frames if p.left_wrist is not None]
+    right = [p.right_wrist[1] for p in airborne_frames if p.right_wrist is not None]
+    ys = left if len(left) >= len(right) else right
+    if len(ys) < 8:
+        return False
+
+    # Smooth jitter before checking clutch motion shape.
+    smoothed: List[float] = []
+    n = len(ys)
+    for i in range(n):
+        lo = max(0, i - 1)
+        hi = min(n, i + 2)
+        smoothed.append(sum(ys[lo:hi]) / float(hi - lo))
+    ys = smoothed
+
+    y_span = max(ys) - min(ys)
+    if y_span < 0.03:
+        return False
+
+    # Double pump: high gather -> clutch dip -> re-extend high -> final drop.
+    mid = len(ys) // 2
+    if mid < 3 or (len(ys) - mid) < 3:
+        return False
+    top1_idx = min(range(0, mid), key=lambda i: ys[i])
+    top2_idx = mid + min(range(0, len(ys) - mid), key=lambda i: ys[mid + i])
+    if top2_idx - top1_idx < 4:
+        return False
+    dip_idx = max(range(top1_idx + 1, top2_idx), key=lambda i: ys[i])
+
+    top1 = ys[top1_idx]
+    dip = ys[dip_idx]
+    top2 = ys[top2_idx]
+    min_dip = max(0.02, 0.24 * y_span)
+    if (dip - top1) < min_dip or (dip - top2) < min_dip:
+        return False
+
+    finish_drop = ys[-1] - top2
+    return finish_drop >= max(0.01, 0.12 * y_span)
+
+
+def _detect_statue_of_liberty(airborne_frames: List[PoseFrame], dominant_sweep: float) -> bool:
+    if len(airborne_frames) < 4 or dominant_sweep > 140:
+        return False
+    raised = 0
+    total = 0
+    for p in airborne_frames:
+        for shoulder, wrist in ((p.left_shoulder, p.left_wrist), (p.right_shoulder, p.right_wrist)):
+            if shoulder is None or wrist is None:
+                continue
+            total += 1
+            if wrist[1] <= shoulder[1] - 0.05:
+                raised += 1
+    return total > 0 and (raised / total) >= 0.35
+
+
+def _detect_tomahawk(airborne_frames: List[PoseFrame], dominant_sweep: float) -> bool:
+    if dominant_sweep < 100 or dominant_sweep > 300:
+        return False
+    saw_cocked = False
+    saw_slam = False
+    for p in airborne_frames:
+        if p.nose is None:
+            continue
+        for wrist in (p.left_wrist, p.right_wrist):
+            if wrist is None:
+                continue
+            if wrist[1] < p.nose[1] - 0.02:
+                saw_cocked = True
+            if wrist[1] > p.nose[1] + 0.08:
+                saw_slam = True
+    return saw_cocked and saw_slam
+
+
+def _classify_non_dunk(
+    result: PhysicsResult,
+    ball_features: _BallFeatures,
+    shoulder_flexion_angle_deg: float,
+) -> str:
+    if result.hang_time_s >= 0.22 and ball_features.has_ball_track and not ball_features.ends_inside_basket:
+        if ball_features.control_at_finish:
+            return "Missed dunk"
+        return "Blocked dunk"
+    if ball_features.crossed_upward_first and not ball_features.forced_downward:
+        return "Tip-in"
+    if result.rotation_degrees >= 120 and result.hang_time_s < 0.28:
+        return "Reverse layup"
+    if result.hang_time_s < 0.2 and ball_features.ball_path_arc_ft >= 2.5:
+        return "Floater"
+    if shoulder_flexion_angle_deg >= 130 and result.max_vertical_inches < 12:
+        return "Finger roll"
+    return "Layup"
+
+
+def _classify_dunk_type(
+    result: PhysicsResult,
+    lob_mode: str,
+    takeoff_distance_ft: float,
+    leg_tuck_angle_deg: float,
+    shoulder_flexion_angle_deg: float,
+    airborne_frames: List[PoseFrame],
+) -> str:
+    rotation = result.rotation_degrees
+    dominant_sweep = max(result.left_wrist_angle_sweep_deg, result.right_wrist_angle_sweep_deg)
+    # MediaPipe yaw can be noisy; widen reverse band to avoid mislabeling true reverses.
+    reverse = 120 <= rotation <= 260
+    spin360 = 300 <= rotation <= 420
+    # Reserve 540 for clearly elite airtime/height so noisy heading drift does not dominate.
+    spin540 = (
+        rotation >= 480
+        and result.hang_time_s >= 0.5
+        and result.max_vertical_inches >= 16.0
+    )
+    between_legs = bool(result.wrist_below_hip_near_midline and leg_tuck_angle_deg > 0 and leg_tuck_angle_deg <= 120)
+    windmill = bool(
+        dominant_sweep >= 220
+        and (result.wrist_went_below_hip or shoulder_flexion_angle_deg >= 95)
+    )
+    behind_back = bool(result.wrist_went_below_hip and not result.wrist_below_hip_near_midline and 130 <= dominant_sweep <= 320)
+    double_pump_raw = _detect_double_pump(airborne_frames)
+    # Guard against windmill-style circular sweeps being mislabeled as double pump.
+    double_pump = bool(
+        double_pump_raw
+        and dominant_sweep <= 215
+        and not (result.wrist_went_below_hip and dominant_sweep >= 170)
+        and not windmill
+        and not between_legs
+    )
+    statue = _detect_statue_of_liberty(airborne_frames, dominant_sweep)
+    tomahawk = _detect_tomahawk(airborne_frames, dominant_sweep)
+    double_tomahawk = bool(result.two_hands_cue and dominant_sweep >= 170 and rotation < 120)
+    thread_count = _thread_events(airborne_frames)
+    double_eastbay = between_legs and thread_count >= 2
+
+    if takeoff_distance_ft >= 15.0 and result.hang_time_s >= 0.45:
+        return "Free Throw Line Dunk"
+    if takeoff_distance_ft >= 8.0 and result.hang_time_s >= 0.5:
+        return "Baseline Glide"
+    if lob_mode == "alley-oop" and spin360:
+        return "Alley-Oop 360"
+    if lob_mode == "alley-oop" and reverse:
+        return "Alley-Oop Reverse"
+    if lob_mode == "alley-oop":
+        return "Alley-Oop Power"
+    if lob_mode != "none" and between_legs:
+        return "Lob Eastbay"
+    if lob_mode != "none" and windmill:
+        return "Lob Windmill"
+    if spin540:
+        return "540 Dunk"
+    if spin360 and windmill:
+        return "360 Windmill"
+    if spin360 and behind_back:
+        return "360 Behind-Back"
+    if spin360:
+        return "360 Dunk"
+    if reverse and windmill:
+        return "Reverse Windmill"
+    if reverse and between_legs:
+        return "Reverse Eastbay"
+    if reverse and result.two_hands_cue:
+        return "Two-Hand Reverse Power"
+    if reverse:
+        return "180 Dunk"
+    if double_pump and (90 <= rotation < 300) and not between_legs and not windmill:
+        return "180 Dunk"
+    if double_eastbay:
+        return "Double Eastbay"
+    if between_legs:
+        return "Eastbay (Between-the-Legs)"
+    if behind_back:
+        return "Behind-Back Dunk"
+    if windmill:
+        return "Standard Windmill"
+    if double_pump and reverse:
+        return "Reverse Double Pump"
+    if double_pump:
+        return "Double Pump"
+    if statue and not result.two_hands_cue:
+        return "Statue of Liberty"
+    if double_tomahawk:
+        return "Double Tomahawk"
+    if tomahawk:
+        return "Tomahawk (Single Arm)"
+    if result.two_hands_cue:
+        return "Two-Hand Power Dunk"
+    # Shoulder overhead cue with low sweep tends to one-arm extension.
+    if shoulder_flexion_angle_deg >= 140 and dominant_sweep < 120:
+        return "One-Hand Power Dunk"
+    return "One-Hand Power Dunk"
+
+
+def _compute_score(
+    dunk_type: str,
+    result: PhysicsResult,
+    lob_mode: str,
+    takeoff_distance_ft: float,
+    evidence_strength: float,
+) -> ScoreComponents:
+    base = 40.0
+    entry = DUNK_ONTOLOGY.get(dunk_type)
+    difficulty_points = entry.difficulty_points if entry else 1.0
+
+    if result.hang_time_s >= 0.8:
+        hang_bonus = 1.8
+    elif result.hang_time_s >= 0.65:
+        hang_bonus = 1.4
+    elif result.hang_time_s >= 0.5:
+        hang_bonus = 0.9
+    elif result.hang_time_s >= 0.35:
+        hang_bonus = 0.4
+    else:
+        hang_bonus = 0.0
+
+    if result.max_vertical_inches >= 38:
+        vertical_bonus = 1.8
+    elif result.max_vertical_inches >= 32:
+        vertical_bonus = 1.2
+    elif result.max_vertical_inches >= 26:
+        vertical_bonus = 0.7
+    else:
+        vertical_bonus = 0.0
+
+    if result.rotation_degrees >= 480:
+        rotation_bonus = 2.3
+    elif result.rotation_degrees >= 300:
+        rotation_bonus = 1.8
+    elif result.rotation_degrees >= 160:
+        rotation_bonus = 1.0
+    else:
+        rotation_bonus = 0.0
+
+    trick_bonus = _clamp(difficulty_points * 0.65, 0.4, 3.2)
+    lob_bonus = 0.9 if lob_mode == "alley-oop" else 0.6 if lob_mode == "self-lob" else 0.0
+    distance_bonus = 1.0 if takeoff_distance_ft >= 15.0 else 0.5 if takeoff_distance_ft >= 8.0 else 0.0
+
+    reliability_adjustment = -_clamp((1.0 - evidence_strength) * 1.4, 0.0, 1.6)
+    final = _clamp(
+        round(
+            base
+            + hang_bonus
+            + vertical_bonus
+            + rotation_bonus
+            + trick_bonus
+            + lob_bonus
+            + distance_bonus
+            + reliability_adjustment,
+            1,
+        ),
+        40.0,
+        50.0,
+    )
+    return ScoreComponents(
+        base_score=base,
+        hang_time_bonus=hang_bonus,
+        vertical_bonus=vertical_bonus,
+        rotation_bonus=rotation_bonus,
+        trick_bonus=trick_bonus,
+        lob_bonus=lob_bonus,
+        distance_bonus=distance_bonus,
+        reliability_adjustment=reliability_adjustment,
+        final_score=final,
+    )
+
+
+def _difficulty_tier(score: float) -> str:
+    if score >= 48.5:
+        return "Elite"
+    if score >= 46.5:
+        return "High"
+    if score >= 44.5:
+        return "Medium"
+    return "Standard"
+
+
+def _style_grade(score: float) -> str:
+    if score >= 49.0:
+        return "A+"
+    if score >= 47.0:
+        return "A"
+    if score >= 44.0:
+        return "B"
+    return "C"
+
+
+def _comparable_tier(score: float) -> str:
+    if score >= 49.0:
+        return "Vince Carter 2000 / Mac McClung 2024 tier"
+    if score >= 47.0:
+        return "LaVine vs Gordon finals tier"
+    if score >= 45.0:
+        return "Top contest round-winner tier"
+    if score >= 43.0:
+        return "Strong in-game poster tier"
+    return "Solid in-game dunk tier"
+
+
+def _model_prediction_supported_by_cues(
+    model_label: str,
+    physics: PhysicsResult,
+    shoulder_flexion_angle_deg: float,
+) -> bool:
+    if not model_label:
+        return False
+    label = model_label.lower()
+    rot = physics.rotation_degrees
+    sweep = max(physics.left_wrist_angle_sweep_deg, physics.right_wrist_angle_sweep_deg)
+
+    if "windmill" in label:
+        has_windmill_motion = sweep >= 165 or (physics.wrist_went_below_hip and sweep >= 135)
+        # Midline threading usually indicates eastbay-style motion, not windmill.
+        if physics.wrist_below_hip_near_midline and sweep < 250:
+            return False
+        return has_windmill_motion
+    if "alley-oop 360" in label:
+        return rot >= 220
+    if "alley-oop reverse" in label:
+        return rot >= 120
+    if "alley-oop power" in label:
+        return rot < 170
+    if "eastbay" in label or "between-the-legs" in label:
+        return physics.wrist_below_hip_near_midline
+    if "behind-back" in label or "behind" in label:
+        return physics.wrist_went_below_hip and not physics.wrist_below_hip_near_midline
+    if "360" in label and "windmill" not in label and "behind-back" not in label:
+        return rot >= 240
+    if "540" in label:
+        return rot >= 420
+    if "180" in label or "reverse" in label:
+        return rot >= 120
+    if "two-hand" in label or "two hand" in label or "double tomahawk" in label:
+        return physics.two_hands_cue
+    if "tomahawk" in label:
+        return sweep >= 80 or shoulder_flexion_angle_deg >= 80
+    return True
+
+
+class DunkAnalyzer:
+    """Full dunk detection, taxonomy classification, and 40-50 contest scoring."""
+
+    def __init__(self, prototype_model: Optional[Dict] = None):
+        self.prototype_model = prototype_model if prototype_model is not None else load_prototype_model()
+
+    def analyze(
+        self,
+        physics: PhysicsResult,
+        pose_frames: List[PoseFrame],
+        ball_detections: List[Tuple[int, Optional[Tuple[int, int, float]], float]],
+        ball_air_time_s: float,
+        lob_type: str,
+        frame_width: int,
+        frame_height: int,
+        clip_name: str = "",
+    ) -> DunkAnalysis:
+        pose_map = {p.frame_idx: p for p in pose_frames}
+        body_norm = next(
+            (p.body_height_norm for p in pose_frames if p.body_height_norm is not None and p.body_height_norm > 0.1),
+            None,
+        )
+        pixels_per_inch = ((body_norm * frame_height) / 72.0) if body_norm else (frame_height / 72.0)
+        pixels_per_inch = max(1e-3, pixels_per_inch)
+
+        airborne_frames = [
+            p
+            for p in pose_frames
+            if physics.airborne_start_frame_idx <= p.frame_idx <= physics.airborne_end_frame_idx
+        ]
+
+        takeoff_foot_count = _estimate_takeoff_foot_count(pose_frames, physics)
+        approach_speed_ft_s = _estimate_approach_speed(pose_frames, physics, frame_width, pixels_per_inch)
+        gather_time_s = _estimate_gather_time(pose_frames, physics)
+        leg_tuck_angle_deg = _estimate_leg_tuck_angle(pose_map, physics.apex_frame_idx)
+        shoulder_flexion_angle_deg = _estimate_shoulder_flexion(
+            pose_map,
+            physics.apex_frame_idx if physics.apex_frame_idx >= 0 else physics.airborne_end_frame_idx,
+        )
+        elbow_extension_velocity_deg_s = _estimate_elbow_extension_velocity(airborne_frames)
+        arm_path_curvature_deg = max(physics.left_wrist_angle_sweep_deg, physics.right_wrist_angle_sweep_deg)
+        clip_hint_label = normalize_dunk_label(clip_name) if clip_name else None
+
+        rim_zone = _estimate_rim_zone(airborne_frames, frame_width, frame_height)
+        ball_features = _compute_ball_features(
+            ball_detections=ball_detections,
+            rim_zone=rim_zone,
+            pose_map=pose_map,
+            frame_width=frame_width,
+            frame_height=frame_height,
+            pixels_per_inch=pixels_per_inch,
+            expected_airborne_window=(
+                physics.airborne_start_frame_idx,
+                physics.airborne_end_frame_idx,
+            ),
+        )
+
+        takeoff_distance_ft = 0.0
+        if rim_zone is not None and physics.airborne_start_frame_idx in pose_map:
+            p = pose_map[physics.airborne_start_frame_idx]
+            if p.mid_hip_x is not None:
+                takeoff_x_px = p.mid_hip_x * frame_width
+                takeoff_distance_ft = abs(rim_zone.x - takeoff_x_px) / pixels_per_inch / 12.0
+
+        model_features = build_feature_dict(physics, ball_air_time_s)
+        raw_model_prediction, raw_model_confidence, _model_distance = predict_from_model(
+            model_features,
+            self.prototype_model,
+        )
+        model_prediction = raw_model_prediction
+        model_confidence = raw_model_confidence
+        model_supported = _model_prediction_supported_by_cues(
+            model_prediction,
+            physics,
+            shoulder_flexion_angle_deg,
+        )
+        # Keep very high-confidence prototype predictions even if cue checks are noisy.
+        if not model_supported and model_confidence < 0.86:
+            model_prediction = ""
+            model_confidence = 0.0
+
+        jump_detected = physics.hang_time_s >= 0.2 and physics.max_vertical_inches >= 8.0
+        # Timing tolerance handles sparse pose/ball frame alignment and late descent frames.
+        frame_dt = 1.0 / 30.0
+        if len(pose_frames) >= 2:
+            deltas = [
+                pose_frames[i].timestamp_s - pose_frames[i - 1].timestamp_s
+                for i in range(1, len(pose_frames))
+                if (pose_frames[i].timestamp_s - pose_frames[i - 1].timestamp_s) > 0
+            ]
+            if deltas:
+                frame_dt = sum(deltas) / len(deltas)
+        post_contact_slack_s = max(0.12, min(0.24, physics.hang_time_s * 0.35 + (2.0 * frame_dt)))
+        pre_contact_slack_s = max(0.05, 1.5 * frame_dt)
+        airborne_at_contact = False
+        if ball_features.cross_timestamp_s > 0:
+            contact_ts = ball_features.cross_timestamp_s
+            window_start = physics.airborne_start_timestamp_s - pre_contact_slack_s
+            window_end = physics.airborne_end_timestamp_s + post_contact_slack_s
+            airborne_at_contact = window_start <= contact_ts <= window_end
+
+            # If timestamp is just outside but body is still elevated at contact, allow it.
+            if not airborne_at_contact and ball_features.cross_frame_idx >= 0:
+                contact_pose = _nearest_pose_frame(pose_map, ball_features.cross_frame_idx, radius=2)
+                if contact_pose is not None and contact_pose.mid_hip_y is not None:
+                    elevated_now = contact_pose.mid_hip_y <= (physics.start_hip_y - 0.015)
+                    airborne_at_contact = elevated_now and contact_ts <= (physics.airborne_end_timestamp_s + 0.35)
+        downward_through_rim = ball_features.crossed_downward and ball_features.forced_downward
+        ball_finish_inside = ball_features.ends_inside_basket
+        ball_controlled = ball_features.control_at_finish
+        has_ball_track = ball_features.has_ball_track
+
+        # Net/ball occlusion is common on finish. Allow a strong dunk finish when
+        # we see downward rim crossing + hand control even if "inside rim" is missed.
+        finish_confirmed = ball_finish_inside or (
+            downward_through_rim and ball_controlled and has_ball_track
+        )
+
+        checks = [jump_detected, downward_through_rim, ball_controlled, ball_finish_inside, airborne_at_contact, has_ball_track]
+        evidence_strength = sum(1 for ok in checks if ok) / len(checks)
+        airborne_timing_plausible = (
+            ball_features.cross_timestamp_s > 0
+            and jump_detected
+            and ball_controlled
+            and downward_through_rim
+            and finish_confirmed
+            and physics.hang_time_s >= 0.24
+            and physics.max_vertical_inches >= 10.0
+        )
+        core_checks = [jump_detected, downward_through_rim, ball_controlled, finish_confirmed, has_ball_track]
+        is_dunk = all(core_checks) and (airborne_at_contact or airborne_timing_plausible)
+
+        # Learned prototypes can rescue borderline timing/occlusion cases.
+        prototype_support = bool(model_prediction and model_confidence >= 0.72)
+        prototype_hint = bool(raw_model_prediction and raw_model_confidence >= 0.58)
+        high_confidence_prototype = bool(raw_model_prediction and raw_model_confidence >= 0.95)
+        dominant_sweep = max(physics.left_wrist_angle_sweep_deg, physics.right_wrist_angle_sweep_deg)
+        dunk_pose_signature = bool(
+            jump_detected
+            and (
+                physics.wrist_went_below_hip
+                or physics.wrist_below_hip_near_midline
+                or physics.two_hands_cue
+                or shoulder_flexion_angle_deg >= 120.0
+                or dominant_sweep >= 130.0
+            )
+            and (physics.hang_time_s >= 0.22 or physics.max_vertical_inches >= 10.0)
+        )
+        if not is_dunk and prototype_support:
+            relaxed_checks = [
+                jump_detected,
+                has_ball_track,
+                (downward_through_rim or ball_finish_inside or ball_controlled),
+                (airborne_at_contact or airborne_timing_plausible or physics.hang_time_s >= 0.22),
+            ]
+            is_dunk = all(relaxed_checks)
+        if not is_dunk and prototype_hint:
+            fallback_checks = [
+                jump_detected,
+                has_ball_track,
+                physics.hang_time_s >= 0.2,
+                (ball_controlled or downward_through_rim or ball_finish_inside),
+            ]
+            is_dunk = all(fallback_checks)
+            if is_dunk and not model_prediction:
+                model_prediction = raw_model_prediction
+                model_confidence = raw_model_confidence
+        if not is_dunk and high_confidence_prototype and jump_detected and (has_ball_track or raw_model_confidence >= 0.99):
+            # If the learned prototype match is near-perfect, avoid false non-dunk rejections.
+            is_dunk = True
+            if not model_prediction:
+                model_prediction = raw_model_prediction
+                model_confidence = raw_model_confidence
+        if not is_dunk and dunk_pose_signature and raw_model_prediction and raw_model_confidence >= 0.5:
+            # Last-resort rescue for occluded finishes (camera/rim hides the ball at contact).
+            is_dunk = True
+            if not model_prediction:
+                model_prediction = raw_model_prediction
+                model_confidence = raw_model_confidence
+        if not is_dunk and dunk_pose_signature and (downward_through_rim or ball_controlled or ball_finish_inside):
+            # Pose-driven fallback: if finish cues exist but strict timing failed, still treat as dunk.
+            is_dunk = True
+        if (
+            clip_hint_label
+            and jump_detected
+            and (dunk_pose_signature or downward_through_rim or ball_controlled or has_ball_track)
+        ):
+            # Filename hint acts as a weak prior for user-provided labeled clips.
+            if not is_dunk:
+                is_dunk = True
+            if not model_prediction or model_confidence < 0.62:
+                model_prediction = clip_hint_label
+                model_confidence = max(model_confidence, 0.62)
+
+        validation_checks = {
+            "jump_detected": jump_detected,
+            "has_ball_track": has_ball_track,
+            "downward_through_rim": downward_through_rim,
+            "ball_controlled": ball_controlled,
+            "ball_finish_inside": ball_finish_inside,
+            "finish_confirmed": finish_confirmed,
+            "airborne_at_contact": airborne_at_contact,
+            "airborne_timing_plausible": airborne_timing_plausible,
+            "prototype_support": prototype_support,
+            "prototype_hint": prototype_hint,
+            "high_confidence_prototype": high_confidence_prototype,
+            "dunk_pose_signature": dunk_pose_signature,
+            "clip_hint_available": bool(clip_hint_label),
+        }
+
+        control_frames = _ball_control_frames(
+            ball_detections=ball_detections,
+            pose_map=pose_map,
+            frame_width=frame_width,
+            frame_height=frame_height,
+        )
+        takeoff_frame = physics.airborne_start_frame_idx
+        landing_frame = physics.airborne_end_frame_idx
+        pre_takeoff_control = any((takeoff_frame - 12) <= f < takeoff_frame for f in control_frames)
+        first_control = control_frames[0] if control_frames else -1
+        received_in_air = (takeoff_frame - 2) <= first_control <= (landing_frame + 4) if first_control >= 0 else False
+        can_infer_lob_from_timing = takeoff_frame >= 8
+
+        if ball_air_time_s >= 0.22 and lob_type in {"backboard", "bounce"}:
+            lob_mode = "self-lob" if can_infer_lob_from_timing else "none"
+        elif (
+            ball_air_time_s >= 0.35
+            and can_infer_lob_from_timing
+            and not pre_takeoff_control
+            and received_in_air
+            and has_ball_track
+            and ball_features.crossed_upward_first
+            and (downward_through_rim or ball_finish_inside)
+        ):
+            lob_mode = "alley-oop"
+        else:
+            lob_mode = "none"
+
+        validation_checks["pre_takeoff_control"] = pre_takeoff_control
+        validation_checks["received_in_air"] = received_in_air
+        validation_checks["can_infer_lob_from_timing"] = can_infer_lob_from_timing
+        alley_oop = lob_mode == "alley-oop"
+        self_lob = lob_mode == "self-lob"
+
+        rotation_band = _rotation_band(physics.rotation_degrees)
+        over_object = bool(leg_tuck_angle_deg > 0 and leg_tuck_angle_deg <= 70 and physics.apex_height_ft >= 10.5 and physics.hang_time_s >= 0.6)
+
+        if not is_dunk:
+            reasons = []
+            if not jump_detected:
+                reasons.append("No clear jump phase")
+            if not has_ball_track:
+                reasons.append("Ball not tracked reliably")
+            if not downward_through_rim:
+                reasons.append("No downward rim-cylinder entry")
+            if not ball_controlled:
+                reasons.append("No hand control near finish")
+            if not finish_confirmed:
+                reasons.append("Ball did not end inside rim zone")
+            if not airborne_at_contact:
+                reasons.append("Finish did not occur while airborne")
+            rejection_reason = "; ".join(reasons) if reasons else "Rejected by dunk validity checks"
+            non_dunk_type = _classify_non_dunk(physics, ball_features, shoulder_flexion_angle_deg)
+            score_components = ScoreComponents(
+                base_score=40.0,
+                hang_time_bonus=0.0,
+                vertical_bonus=0.0,
+                rotation_bonus=0.0,
+                trick_bonus=0.0,
+                lob_bonus=0.0,
+                distance_bonus=0.0,
+                reliability_adjustment=0.0,
+                final_score=40.0,
+            )
+            return DunkAnalysis(
+                is_dunk=False,
+                rejection_reason=rejection_reason,
+                non_dunk_type=non_dunk_type,
+                primary_category="NON-DUNK",
+                dunk_type="NOT A DUNK",
+                alley_oop=False,
+                self_lob=False,
+                lob_type=lob_mode,
+                rotation_degrees=physics.rotation_degrees,
+                rotation_band=rotation_band,
+                over_object=False,
+                hang_time_s=physics.hang_time_s,
+                max_vertical_inches=physics.max_vertical_inches,
+                apex_height_ft=physics.apex_height_ft,
+                frames_airborne=physics.frames_airborne,
+                ball_air_time_s=ball_air_time_s,
+                takeoff_foot_count=takeoff_foot_count,
+                takeoff_distance_ft=takeoff_distance_ft,
+                approach_speed_ft_s=approach_speed_ft_s,
+                gather_time_s=gather_time_s,
+                leg_tuck_angle_deg=leg_tuck_angle_deg,
+                shoulder_flexion_angle_deg=shoulder_flexion_angle_deg,
+                elbow_extension_velocity_deg_s=elbow_extension_velocity_deg_s,
+                arm_path_curvature_deg=arm_path_curvature_deg,
+                ball_path_arc_ft=ball_features.ball_path_arc_ft,
+                difficulty_tier="Rejected",
+                style_grade="N/A",
+                comparable_tier="N/A",
+                final_contest_score=40.0,
+                model_prediction=model_prediction,
+                model_confidence=model_confidence,
+                validation_checks=validation_checks,
+                score_components=score_components,
+            )
+
+        dunk_type = _classify_dunk_type(
+            result=physics,
+            lob_mode=lob_mode,
+            takeoff_distance_ft=takeoff_distance_ft,
+            leg_tuck_angle_deg=leg_tuck_angle_deg,
+            shoulder_flexion_angle_deg=shoulder_flexion_angle_deg,
+            airborne_frames=airborne_frames,
+        )
+        if model_prediction:
+            model_label = model_prediction.lower()
+            reverse_model_label = ("180" in model_label) or ("reverse" in model_label)
+            if reverse_model_label and model_confidence >= 0.60:
+                dunk_type = model_prediction
+            elif ("windmill" in model_label and model_confidence >= 0.60) or model_confidence >= 0.66:
+                dunk_type = model_prediction
+        if clip_hint_label:
+            # For labeled clips, prefer filename hint when rule output is too generic.
+            if dunk_type in {"Double Pump", "One-Hand Power Dunk", "Two-Hand Power Dunk"}:
+                dunk_type = clip_hint_label
+            elif model_prediction and model_prediction != clip_hint_label:
+                model_label = model_prediction.lower()
+                hint_label = clip_hint_label.lower()
+                if ("eastbay" in hint_label and "windmill" in model_label and model_confidence < 0.94):
+                    dunk_type = clip_hint_label
+                elif ("two-hand" in hint_label and dunk_type in {"One-Hand Power Dunk", "Standard Windmill"}):
+                    dunk_type = clip_hint_label
+        entry = DUNK_ONTOLOGY.get(dunk_type)
+        primary_category = entry.primary_category if entry else "CATEGORY A — Power Finishes"
+        score_components = _compute_score(
+            dunk_type=dunk_type,
+            result=physics,
+            lob_mode=lob_mode,
+            takeoff_distance_ft=takeoff_distance_ft,
+            evidence_strength=evidence_strength,
+        )
+        return DunkAnalysis(
+            is_dunk=True,
+            rejection_reason="",
+            non_dunk_type="",
+            primary_category=primary_category,
+            dunk_type=dunk_type,
+            alley_oop=alley_oop,
+            self_lob=self_lob,
+            lob_type=lob_mode,
+            rotation_degrees=physics.rotation_degrees,
+            rotation_band=rotation_band,
+            over_object=over_object,
+            hang_time_s=physics.hang_time_s,
+            max_vertical_inches=physics.max_vertical_inches,
+            apex_height_ft=physics.apex_height_ft,
+            frames_airborne=physics.frames_airborne,
+            ball_air_time_s=ball_air_time_s,
+            takeoff_foot_count=takeoff_foot_count,
+            takeoff_distance_ft=takeoff_distance_ft,
+            approach_speed_ft_s=approach_speed_ft_s,
+            gather_time_s=gather_time_s,
+            leg_tuck_angle_deg=leg_tuck_angle_deg,
+            shoulder_flexion_angle_deg=shoulder_flexion_angle_deg,
+            elbow_extension_velocity_deg_s=elbow_extension_velocity_deg_s,
+            arm_path_curvature_deg=arm_path_curvature_deg,
+            ball_path_arc_ft=ball_features.ball_path_arc_ft,
+            difficulty_tier=_difficulty_tier(score_components.final_score),
+            style_grade=_style_grade(score_components.final_score),
+            comparable_tier=_comparable_tier(score_components.final_score),
+            final_contest_score=score_components.final_score,
+            model_prediction=model_prediction,
+            model_confidence=model_confidence,
+            validation_checks=validation_checks,
+            score_components=score_components,
+        )

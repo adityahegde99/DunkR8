@@ -615,9 +615,6 @@ def main():
         st.session_state.analysis_step = 0
     if 'uploaded_file_data' not in st.session_state:
         st.session_state.uploaded_file_data = None
-    if "uploader_nonce" not in st.session_state:
-        st.session_state.uploader_nonce = 0
-
     # Analysis steps
     analysis_steps = [
         "Processing video frames",
@@ -668,7 +665,7 @@ def main():
                 type=["mp4", "mov", "avi", "webm"],
                 help="Drag and drop or click to choose a dunk video.",
                 label_visibility="collapsed",
-                key=f"main_upload_{st.session_state.uploader_nonce}",
+                key="main_upload",
             )
                 
         if uploaded_file is not None:
@@ -1078,18 +1075,6 @@ def main():
                 height=1700,
                 scrolling=False,
             )
-
-        # Add "Analyze Another" button
-        st.markdown("<br>", unsafe_allow_html=True)
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            if st.button("Analyze Another Dunk", use_container_width=True, type="primary"):
-                st.session_state.uploaded_file_data = None
-                st.session_state.analysis_step = 0
-                st.session_state["judge_reasoning"] = ""
-                st.session_state["judge_reasoning_key"] = ""
-                st.session_state.uploader_nonce += 1
-                st.rerun()
 
     except Exception as e:
         st.error(f"Analysis failed: {str(e)}")

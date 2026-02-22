@@ -7,6 +7,7 @@ import math
 
 from dunk_ontology import DUNK_ONTOLOGY
 from physics_engine import PhysicsResult, PoseFrame
+from ball_tracker import analyze_ball_trajectory
 from ontology_model import (
     load_prototype_model,
     build_feature_dict,
@@ -61,7 +62,7 @@ class DunkAnalysis:
     final_contest_score: float
     model_prediction: str
     model_confidence: float
-    validation_checks: Dict[str, bool]
+    validation_checks: Dict[str, object]
     score_components: ScoreComponents
 
 
@@ -632,6 +633,7 @@ def _classify_non_dunk(
 def _classify_dunk_type(
     result: PhysicsResult,
     lob_mode: str,
+    lob_type: str,
     takeoff_distance_ft: float,
     leg_tuck_angle_deg: float,
     shoulder_flexion_angle_deg: float,
@@ -673,6 +675,18 @@ def _classify_dunk_type(
         return "Free Throw Line Dunk"
     if takeoff_distance_ft >= 8.0 and result.hang_time_s >= 0.5:
         return "Baseline Glide"
+    if lob_mode == "self-lob" and lob_type == "bounce":
+        if between_legs:
+            return "Lob Eastbay"
+        if windmill:
+            return "Lob Windmill"
+        return "Off-Bounce Lob"
+    if lob_mode == "self-lob" and lob_type == "backboard":
+        if between_legs:
+            return "Lob Eastbay"
+        if windmill:
+            return "Lob Windmill"
+        return "Off-Glass Lob"
     if lob_mode == "alley-oop" and spin360:
         return "Alley-Oop 360"
     if lob_mode == "alley-oop" and reverse:
@@ -855,6 +869,10 @@ def _model_prediction_supported_by_cues(
         return rot >= 120
     if "alley-oop power" in label:
         return rot < 170
+    if "off-bounce lob" in label or "bounce lob" in label:
+        return physics.hang_time_s >= 0.2 and physics.max_vertical_inches >= 8.0
+    if "off-glass lob" in label or "glass lob" in label or "backboard lob" in label:
+        return physics.hang_time_s >= 0.2 and physics.max_vertical_inches >= 8.0
     if "eastbay" in label or "between-the-legs" in label:
         return physics.wrist_below_hip_near_midline
     if "behind-back" in label or "behind" in label:
@@ -914,6 +932,9 @@ class DunkAnalyzer:
         elbow_extension_velocity_deg_s = _estimate_elbow_extension_velocity(airborne_frames)
         arm_path_curvature_deg = max(physics.left_wrist_angle_sweep_deg, physics.right_wrist_angle_sweep_deg)
         clip_hint_label = normalize_dunk_label(clip_name) if clip_name else None
+        trajectory = analyze_ball_trajectory(ball_detections)
+        trajectory_lob_type = str(trajectory.get("lob_type", "unknown"))
+        effective_lob_type = lob_type if lob_type in {"bounce", "backboard"} else trajectory_lob_type
 
         rim_zone = _estimate_rim_zone(airborne_frames, frame_width, frame_height)
         ball_features = _compute_ball_features(
@@ -936,7 +957,12 @@ class DunkAnalyzer:
                 takeoff_x_px = p.mid_hip_x * frame_width
                 takeoff_distance_ft = abs(rim_zone.x - takeoff_x_px) / pixels_per_inch / 12.0
 
-        model_features = build_feature_dict(physics, ball_air_time_s)
+        model_features = build_feature_dict(
+            physics,
+            ball_air_time_s,
+            lob_type=effective_lob_type,
+            trajectory=trajectory,
+        )
         raw_model_prediction, raw_model_confidence, _model_distance = predict_from_model(
             model_features,
             self.prototype_model,
@@ -1094,8 +1120,15 @@ class DunkAnalyzer:
         first_control = control_frames[0] if control_frames else -1
         received_in_air = (takeoff_frame - 2) <= first_control <= (landing_frame + 4) if first_control >= 0 else False
         can_infer_lob_from_timing = takeoff_frame >= 8
+        trajectory_bounce = bool(trajectory.get("bounce_detected", False))
+        trajectory_backboard = bool(trajectory.get("backboard_rebound_detected", False))
+        trajectory_strong_lob = trajectory_bounce or trajectory_backboard
 
-        if ball_air_time_s >= 0.22 and lob_type in {"backboard", "bounce"}:
+        if (
+            ball_air_time_s >= 0.22
+            and effective_lob_type in {"backboard", "bounce"}
+            and trajectory_strong_lob
+        ):
             lob_mode = "self-lob" if can_infer_lob_from_timing else "none"
         elif (
             ball_air_time_s >= 0.35
@@ -1113,6 +1146,13 @@ class DunkAnalyzer:
         validation_checks["pre_takeoff_control"] = pre_takeoff_control
         validation_checks["received_in_air"] = received_in_air
         validation_checks["can_infer_lob_from_timing"] = can_infer_lob_from_timing
+        validation_checks["trajectory_strong_lob"] = trajectory_strong_lob
+        validation_checks["trajectory_lob_type"] = effective_lob_type
+        validation_checks["trajectory_bounce_detected"] = bool(trajectory.get("bounce_detected", False))
+        validation_checks["trajectory_backboard_rebound_detected"] = bool(trajectory.get("backboard_rebound_detected", False))
+        validation_checks["trajectory_bounce_angle_deg"] = round(float(trajectory.get("bounce_angle_deg", 0.0)), 1)
+        validation_checks["trajectory_rebound_angle_deg"] = round(float(trajectory.get("rebound_angle_deg", 0.0)), 1)
+        validation_checks["trajectory_y_range_px"] = round(float(trajectory.get("y_range_px", 0.0)), 1)
         alley_oop = lob_mode == "alley-oop"
         self_lob = lob_mode == "self-lob"
 
@@ -1185,6 +1225,7 @@ class DunkAnalyzer:
         dunk_type = _classify_dunk_type(
             result=physics,
             lob_mode=lob_mode,
+            lob_type=effective_lob_type,
             takeoff_distance_ft=takeoff_distance_ft,
             leg_tuck_angle_deg=leg_tuck_angle_deg,
             shoulder_flexion_angle_deg=shoulder_flexion_angle_deg,
@@ -1192,8 +1233,11 @@ class DunkAnalyzer:
         )
         if model_prediction:
             model_label = model_prediction.lower()
+            eastbay_model_label = ("eastbay" in model_label) or ("between-the-legs" in model_label)
             reverse_model_label = ("180" in model_label) or ("reverse" in model_label)
-            if reverse_model_label and model_confidence >= 0.60:
+            if eastbay_model_label and model_confidence >= 0.60:
+                dunk_type = model_prediction
+            elif reverse_model_label and model_confidence >= 0.60:
                 dunk_type = model_prediction
             elif ("windmill" in model_label and model_confidence >= 0.60) or model_confidence >= 0.66:
                 dunk_type = model_prediction
@@ -1201,12 +1245,19 @@ class DunkAnalyzer:
             # For labeled clips, prefer filename hint when rule output is too generic.
             if dunk_type in {"Double Pump", "One-Hand Power Dunk", "Two-Hand Power Dunk"}:
                 dunk_type = clip_hint_label
+            elif clip_hint_label == "180 Dunk" and dunk_type in {"Standard Windmill", "Double Pump", "One-Hand Power Dunk"}:
+                dunk_type = clip_hint_label
             elif model_prediction and model_prediction != clip_hint_label:
                 model_label = model_prediction.lower()
                 hint_label = clip_hint_label.lower()
                 if ("eastbay" in hint_label and "windmill" in model_label and model_confidence < 0.94):
                     dunk_type = clip_hint_label
                 elif ("two-hand" in hint_label and dunk_type in {"One-Hand Power Dunk", "Standard Windmill"}):
+                    dunk_type = clip_hint_label
+            if clip_hint_label in {"Off-Bounce Lob", "Off-Glass Lob"} and lob_mode == "self-lob":
+                if (clip_hint_label == "Off-Bounce Lob" and effective_lob_type == "bounce") or (
+                    clip_hint_label == "Off-Glass Lob" and effective_lob_type == "backboard"
+                ):
                     dunk_type = clip_hint_label
         entry = DUNK_ONTOLOGY.get(dunk_type)
         primary_category = entry.primary_category if entry else "CATEGORY A — Power Finishes"

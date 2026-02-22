@@ -11,6 +11,7 @@ import json
 
 from pose_processor import PoseProcessor, process_video
 from physics_engine import PhysicsEngine
+from ball_tracker import analyze_ball_trajectory
 from ontology_model import (
     MODEL_PATH,
     FEATURE_KEYS,
@@ -77,7 +78,7 @@ def train_from_reference_clips(clips_dir: Path = DEFAULT_CLIPS_DIR) -> TrainingS
         try:
             # Fresh processor per clip avoids Tasks API timestamp carryover.
             processor = PoseProcessor()
-            pose_frames, skeleton_frames, fps, _ball_detections, ball_air_time_s, _lob_type = process_video(str(clip), processor)
+            pose_frames, skeleton_frames, fps, ball_detections, ball_air_time_s, lob_type = process_video(str(clip), processor)
             if not pose_frames or not skeleton_frames:
                 skipped.append(f"{clip.name}: no usable pose/frames")
                 continue
@@ -90,7 +91,14 @@ def train_from_reference_clips(clips_dir: Path = DEFAULT_CLIPS_DIR) -> TrainingS
             if result is None:
                 skipped.append(f"{clip.name}: no physics result")
                 continue
-            feat = build_feature_dict(result, ball_air_time_s)
+            trajectory = analyze_ball_trajectory(ball_detections)
+            effective_lob_type = lob_type if lob_type in {"bounce", "backboard"} else str(trajectory.get("lob_type", "unknown"))
+            feat = build_feature_dict(
+                result,
+                ball_air_time_s,
+                lob_type=effective_lob_type,
+                trajectory=trajectory,
+            )
             grouped.setdefault(label, []).append(feat)
         except Exception as exc:
             skipped.append(f"{clip.name}: {exc}")

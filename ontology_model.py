@@ -24,6 +24,10 @@ FEATURE_KEYS = [
     "wrist_below_hip_midline",
     "two_hands_cue",
     "ball_air_time_s",
+    "lob_bounce",
+    "lob_backboard",
+    "lob_bounce_angle_deg",
+    "lob_rebound_angle_deg",
 ]
 
 FEATURE_SCALES = {
@@ -36,6 +40,10 @@ FEATURE_SCALES = {
     "wrist_below_hip_midline": 1.0,
     "two_hands_cue": 1.0,
     "ball_air_time_s": 2.0,
+    "lob_bounce": 1.0,
+    "lob_backboard": 1.0,
+    "lob_bounce_angle_deg": 180.0,
+    "lob_rebound_angle_deg": 180.0,
 }
 
 FEATURE_WEIGHTS = {
@@ -48,13 +56,26 @@ FEATURE_WEIGHTS = {
     "wrist_below_hip_midline": 1.4,
     "two_hands_cue": 1.0,
     "ball_air_time_s": 0.7,
+    "lob_bounce": 1.1,
+    "lob_backboard": 1.1,
+    "lob_bounce_angle_deg": 0.45,
+    "lob_rebound_angle_deg": 0.45,
 }
 
 
 def build_feature_dict(
     result: PhysicsResult,
     ball_air_time_s: float,
+    lob_type: str = "unknown",
+    trajectory: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
+    trajectory = trajectory or {}
+    bounce_angle = float(trajectory.get("bounce_angle_deg", 0.0) or 0.0)
+    rebound_angle = float(trajectory.get("rebound_angle_deg", 0.0) or 0.0)
+    if not math.isfinite(bounce_angle):
+        bounce_angle = 0.0
+    if not math.isfinite(rebound_angle):
+        rebound_angle = 0.0
     return {
         "rotation_degrees": float(result.rotation_degrees),
         "hang_time_s": float(result.hang_time_s),
@@ -65,6 +86,10 @@ def build_feature_dict(
         "wrist_below_hip_midline": 1.0 if getattr(result, "wrist_below_hip_near_midline", False) else 0.0,
         "two_hands_cue": 1.0 if getattr(result, "two_hands_cue", False) else 0.0,
         "ball_air_time_s": float(ball_air_time_s),
+        "lob_bounce": 1.0 if lob_type == "bounce" else 0.0,
+        "lob_backboard": 1.0 if lob_type == "backboard" else 0.0,
+        "lob_bounce_angle_deg": bounce_angle,
+        "lob_rebound_angle_deg": rebound_angle,
     }
 
 
@@ -129,6 +154,13 @@ def normalize_dunk_label(raw_label: str) -> Optional[str]:
         "alley oop reverse": "Alley-Oop Reverse",
         "alley oop 360": "Alley-Oop 360",
         "lob windmill": "Lob Windmill",
+        "off bounce lob": "Off-Bounce Lob",
+        "off the bounce lob": "Off-Bounce Lob",
+        "bounce lob": "Off-Bounce Lob",
+        "off glass lob": "Off-Glass Lob",
+        "off the glass lob": "Off-Glass Lob",
+        "glass lob": "Off-Glass Lob",
+        "backboard lob": "Off-Glass Lob",
         "free throw line": "Free Throw Line Dunk",
         "baseline glide": "Baseline Glide",
         "putback": "Putback Dunk",
@@ -140,6 +172,8 @@ def normalize_dunk_label(raw_label: str) -> Optional[str]:
         "reverse": "180 Dunk",
         "long dunk": "Free Throw Line Dunk",
         "long": "Free Throw Line Dunk",
+        "off bounce": "Off-Bounce Lob",
+        "off glass": "Off-Glass Lob",
     }
     if tokens in alias_map:
         return alias_map[tokens]
@@ -155,6 +189,9 @@ def normalize_dunk_label(raw_label: str) -> Optional[str]:
         ("putback", "Putback Dunk"),
         ("free throw", "Free Throw Line Dunk"),
         ("baseline", "Baseline Glide"),
+        ("bounce lob", "Off-Bounce Lob"),
+        ("glass lob", "Off-Glass Lob"),
+        ("backboard lob", "Off-Glass Lob"),
     ]
     for needle, canonical in contains_map:
         if needle in tokens:

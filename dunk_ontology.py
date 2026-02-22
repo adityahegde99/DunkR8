@@ -166,6 +166,18 @@ DUNK_ONTOLOGY: Dict[str, DunkOntologyEntry] = {
         difficulty_points=3.4,
         description="Lob catch combined with a windmill arm path.",
     ),
+    "Off-Bounce Lob": DunkOntologyEntry(
+        canonical_name="Off-Bounce Lob",
+        primary_category="CATEGORY H — Lob & Assisted Dunks",
+        difficulty_points=2.9,
+        description="Self-lob off the floor bounce into a dunk finish.",
+    ),
+    "Off-Glass Lob": DunkOntologyEntry(
+        canonical_name="Off-Glass Lob",
+        primary_category="CATEGORY H — Lob & Assisted Dunks",
+        difficulty_points=3.0,
+        description="Self-lob off the backboard before the dunk finish.",
+    ),
     # CATEGORY I — Distance & Glide
     "Free Throw Line Dunk": DunkOntologyEntry(
         canonical_name="Free Throw Line Dunk",

@@ -123,17 +123,29 @@ class PhysicsEngine:
         # Ground level: percentile of foot y (when feet are lowest = on ground)
         all_foot_ys = []
         for p in valid:
-            all_foot_ys.append(p.left_heel_y)
-            all_foot_ys.append(p.right_heel_y)
-        all_foot_ys.sort(reverse=True)
-        idx_95 = max(0, int(len(all_foot_ys) * 0.05) - 1)
-        baseline_y = all_foot_ys[idx_95] if all_foot_ys else 0.9
-        # Foot-based airborne threshold (lower y = higher in frame)
-        threshold_y = baseline_y - 0.04
+            if p.left_heel_y is not None and -0.2 <= p.left_heel_y <= 1.5:
+                all_foot_ys.append(p.left_heel_y)
+            if p.right_heel_y is not None and -0.2 <= p.right_heel_y <= 1.5:
+                all_foot_ys.append(p.right_heel_y)
+        all_foot_ys.sort()
+        if all_foot_ys:
+            idx_ground = int((len(all_foot_ys) - 1) * 0.85)
+            baseline_y = all_foot_ys[idx_ground]
+        else:
+            baseline_y = 0.9
+        # Foot-based airborne threshold (lower y = higher in frame).
+        # Slightly stricter margin avoids counting running strides as airborne.
+        threshold_y = baseline_y - 0.055
         # Hip-based fallback keeps airborne state robust when one foot landmark flickers.
-        hip_vals = [p.mid_hip_y for p in valid if p.mid_hip_y is not None]
-        hip_baseline_y = max(hip_vals) if hip_vals else 0.7
-        hip_air_threshold = hip_baseline_y - 0.03
+        # Use a robust "ground-ish" hip baseline (high percentile), not raw max.
+        hip_vals = [p.mid_hip_y for p in valid if p.mid_hip_y is not None and -0.2 <= p.mid_hip_y <= 1.5]
+        if hip_vals:
+            hip_vals_sorted = sorted(hip_vals)
+            idx_hip_ground = int((len(hip_vals_sorted) - 1) * 0.85)
+            hip_baseline_y = hip_vals_sorted[idx_hip_ground]
+        else:
+            hip_baseline_y = 0.7
+        hip_air_threshold = hip_baseline_y - 0.04
 
         # Find airborne intervals using both foot and hip cues.
         airborne_start: Optional[int] = None
@@ -144,9 +156,15 @@ class PhysicsEngine:
         i = 0
         while i < len(valid):
             p = valid[i]
-            both_above = p.left_heel_y < threshold_y and p.right_heel_y < threshold_y
+            left_above = p.left_heel_y < threshold_y
+            right_above = p.right_heel_y < threshold_y
+            both_above = left_above and right_above
+            avg_foot_y = (p.left_heel_y + p.right_heel_y) * 0.5
+            # Allow hip fallback only when average foot height also indicates lift.
+            avg_feet_elevated = avg_foot_y < (threshold_y + 0.015)
             hip_high = p.mid_hip_y is not None and p.mid_hip_y < hip_air_threshold
-            airborne_like = both_above or hip_high
+            # Require foot corroboration for hip fallback to avoid long false-airborne runs.
+            airborne_like = both_above or (hip_high and avg_feet_elevated)
             if airborne_like and airborne_start is None:
                 airborne_start = i
             elif not airborne_like and airborne_start is not None:
@@ -169,7 +187,22 @@ class PhysicsEngine:
                 max_airborne_duration = duration
                 best_start, best_end = airborne_start, airborne_end
 
-        hang_time_s = max_airborne_duration
+        # If interval is implausibly long, re-anchor to the core hip-elevation window.
+        if max_airborne_duration > 2.5:
+            hip_ys_valid = [p.mid_hip_y for p in valid if p.mid_hip_y is not None]
+            if hip_ys_valid:
+                hip_min = min(hip_ys_valid)
+                core_idxs = [idx for idx, p in enumerate(valid) if p.mid_hip_y is not None and p.mid_hip_y <= (hip_min + 0.07)]
+                if core_idxs:
+                    core_start = core_idxs[0]
+                    core_end = core_idxs[-1]
+                    core_dur = valid[core_end].timestamp_s - valid[core_start].timestamp_s
+                    if 0.22 <= core_dur <= 2.5:
+                        best_start, best_end = core_start, core_end
+                        max_airborne_duration = core_dur
+
+        # Guard against tracking glitches/slow-motion artifacts producing impossible airtime.
+        hang_time_s = min(max_airborne_duration, 2.5)
         airborne_frames_for_arms = valid[best_start : best_end + 1] if max_airborne_duration > 0 else []
         airborne_start_frame_idx = (
             airborne_frames_for_arms[0].frame_idx if airborne_frames_for_arms else -1

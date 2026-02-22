@@ -2,12 +2,12 @@
 DunkR8 - Professional AI-Powered Slam Dunk Analysis
 Beautiful, animated, step-by-step dunk evaluation system.
 """
-import base64
 import tempfile
 from pathlib import Path
 import os
 import time
 from html import escape
+import base64
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -73,6 +73,17 @@ def _cap_display_metrics(analysis) -> dict:
 
 REFERENCE_CLIPS_DIR = Path(__file__).resolve().parent / "reference_dunks" / "clips"
 LANDER_VIDEO_PATH = Path(__file__).resolve().parent / "dunkmix.mp4"
+
+
+@st.cache_data(ttl=3600)
+def _get_lander_video_b64() -> str:
+    """Load and base64-encode lander video for custom no-controls HTML rendering."""
+    if not LANDER_VIDEO_PATH.is_file():
+        return ""
+    try:
+        return base64.b64encode(LANDER_VIDEO_PATH.read_bytes()).decode("utf-8")
+    except OSError:
+        return ""
 
 
 
@@ -243,15 +254,13 @@ def main():
         border: 1px solid rgba(255,255,255,0.10);
         box-shadow: 0 8px 32px rgba(0,0,0,0.5);
     }
-    .landing-video-wrap video,
-    .landing-video-wrap [data-testid="stVideo"],
-    .landing-video-wrap [data-testid="stVideo"] video {
+    .landing-video-wrap video {
         position: absolute !important;
         top: 0 !important;
         left: 0 !important;
         width: 100% !important;
         height: 100% !important;
-        object-fit: contain !important;
+        object-fit: cover !important;
         border-radius: 16px !important;
         border: none !important;
         background: #000 !important;
@@ -470,13 +479,13 @@ def main():
         border-radius: 16px !important;
         border: 2px solid rgba(0,255,255,0.2) !important;
         transition: all 0.3s ease !important;
-        max-height: 560px !important;
+        max-height: min(48vh, 500px) !important;
         overflow: hidden !important;
         background: #000 !important;
     }
 
     [data-testid="stVideo"] video {
-        max-height: 560px !important;
+        max-height: min(48vh, 500px) !important;
         width: 100% !important;
         object-fit: contain !important;
         background: #000 !important;
@@ -545,42 +554,19 @@ def main():
         51%, 100% { opacity: 0; }
     }
     
-    /* Fixed video panel for analysis view */
-    .fixed-video-panel {
-        position: fixed !important;
-        left: 0 !important;
-        top: 60px !important;
-        width: 50% !important;
-        height: calc(100vh - 60px) !important;
-        z-index: 200 !important;
-        display: flex !important;
-        flex-direction: column !important;
-        align-items: center !important;
-        justify-content: center !important;
-        background: rgba(6, 6, 6, 0.99) !important;
-        padding: 1rem 1.5rem !important;
-        box-sizing: border-box !important;
-        border-right: 1px solid rgba(0,255,255,0.18) !important;
-    }
-    .fixed-video-panel video {
-        width: 100% !important;
-        max-height: calc(100vh - 120px) !important;
-        border-radius: 14px !important;
-        border: 2px solid rgba(0,255,255,0.2) !important;
-        object-fit: contain !important;
-        background: #000 !important;
-    }
-    .fixed-video-panel .vid-label {
+    /* Analysis split layout */
+    .analysis-report-title {
         font-weight: 700;
         color: #e2e8f0;
         margin-bottom: 0.6rem;
-        font-size: 1rem;
+        font-size: 1.05rem;
     }
-    /* Report flows full-width; video is the only fixed/floating element */
-    .report-right-half {
-        margin-left: 0 !important;
-        padding: 1rem 2rem 2rem 2rem !important;
-        box-sizing: border-box !important;
+    .analysis-video-title {
+        font-weight: 700;
+        color: #e2e8f0;
+        margin-bottom: 0.6rem;
+        font-size: 1.05rem;
+        text-align: center;
     }
     
     /* Smooth transitions everywhere */
@@ -649,17 +635,18 @@ def main():
         col_video, col_upload = st.columns([1, 1])
         
         with col_video:
-            if LANDER_VIDEO_PATH.is_file():
-                st.markdown('<div class="landing-video-wrap">', unsafe_allow_html=True)
-                st.video(
-                    str(LANDER_VIDEO_PATH),
-                    format="video/mp4",
-                    start_time=0,
-                    autoplay=True,
-                    muted=True,
-                    loop=True,
+            lander_b64 = _get_lander_video_b64()
+            if lander_b64:
+                st.markdown(
+                    f"""
+                    <div class="landing-video-wrap">
+                        <video autoplay loop muted playsinline preload="metadata"
+                            src="data:video/mp4;base64,{lander_b64}">
+                        </video>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
                 )
-                st.markdown('</div>', unsafe_allow_html=True)
             else:
                 st.markdown("""
                 <div class="landing-video-wrap" style="display:flex; align-items: center; justify-content: center; color: #64748b; text-align: center;">
@@ -1066,34 +1053,31 @@ def main():
             </div>
         </div>
         """
-        # Fixed video panel (pure HTML, position:fixed — always visible on left)
-        overlay_b64 = base64.b64encode(overlay_bytes).decode("utf-8") if overlay_bytes else ""
-        if overlay_b64:
-            st.markdown(
-                f"""
-                <div class="fixed-video-panel">
-                    <div class="vid-label">Motion Analysis Video</div>
-                    <video autoplay loop muted playsinline preload="auto"
-                        src="data:video/mp4;base64,{overlay_b64}">
-                    </video>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        # Report on the right half (normal page flow, scrolls naturally)
+        # Stacked layout: video on top, full-width report below
         with results_placeholder.container():
-            st.markdown('<div class="report-right-half">', unsafe_allow_html=True)
+            st.markdown('<div class="analysis-video-title">Motion Analysis Video</div>', unsafe_allow_html=True)
+            if overlay_bytes:
+                st.video(
+                    overlay_bytes,
+                    format="video/mp4",
+                    start_time=0,
+                    autoplay=True,
+                    muted=True,
+                    loop=True,
+                )
+            else:
+                st.warning("Could not render tracked video output.")
+
             st.markdown(
-                '<div style="font-weight:700; color:#e2e8f0; margin-bottom:0.6rem; font-size:1.1rem;">Analysis Report</div>',
+                '<div style="height:1px; width:100%; margin:1rem 0 1rem 0; background:rgba(0,255,255,0.22);"></div>',
                 unsafe_allow_html=True,
             )
+            st.markdown('<div class="analysis-report-title">Analysis Report</div>', unsafe_allow_html=True)
             components.html(
                 f'<div style="font-family: Inter, sans-serif;">{results_html}</div>',
-                height=2200,
+                height=1700,
                 scrolling=False,
             )
-            st.markdown('</div>', unsafe_allow_html=True)
 
         # Add "Analyze Another" button
         st.markdown("<br>", unsafe_allow_html=True)
